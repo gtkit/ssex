@@ -22,10 +22,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # 固定版本：latest 会随上游发布而变，构建结果不可复现。
+      # 与本地开发所用版本保持一致。
       - name: Lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          version: v2.11.4
 
       - name: Test
         run: go test -race -count=1 -timeout=8m ./...
@@ -37,3 +39,8 @@ jobs:
 
       - name: Benchmark
         run: go test -bench=. -benchmem -run='^$' ./...
+
+      - name: Fuzz
+        run: |
+          go test -fuzz=FuzzDecode -fuzztime=30s -run='^$' ./...
+          go test -fuzz=FuzzRoundTrip -fuzztime=30s -run='^$' ./...

@@ -2,7 +2,7 @@
 
 `github.com/gtkit/ssex` 提供 Server-Sent Events 的服务端写入与上游解码能力。
 
-入口只用标准库的 `http.ResponseWriter` 与 `*http.Request`，net/http、gin、chi 都可直接使用；唯一的第三方依赖是 `github.com/gtkit/json/v2`。
+入口只用标准库的 `http.ResponseWriter` 与 `*http.Request`，net/http、gin、chi 都可直接使用；唯一的**直接**第三方依赖是 `github.com/gtkit/json/v2`（它自身另有传递依赖）。
 
 ## 1. 能力总览
 
@@ -14,7 +14,7 @@
 | 重连间隔建议 | `Retry` |
 | 起流状态判断 | `Started` |
 | 终止流并抑制客户端自动重连 | `Close` |
-| 错误分类 | `ErrClientGone` / `ErrStreamClosed` |
+| 错误分类 | `ErrClientGone` / `ErrStreamClosed` / `ErrInvalidArgument` / `ErrWriteTimeout` / `ErrFrameTooLarge` |
 | 单帧写超时 | `WithWriteTimeout` |
 | 解析上游 SSE 流（转发大模型输出） | `Decode` |
 | 在线连接注册表与带外推送 | `Hub` |
@@ -75,7 +75,7 @@
 - [decode.go](./decode.go)：上游 SSE 解码器（`Decode` / `Message`）
 - [hub.go](./hub.go)：在线连接注册表与带外推送（`Hub`）
 - [event.go](./event.go)：待推送的事件值（`Event`）
-- [errors.go](./errors.go)：错误哨兵与分类（`ErrClientGone` / `ErrStreamClosed`）
+- [errors.go](./errors.go)：错误哨兵与分类（5 个哨兵，见 4.10）
 - [options.go](./options.go)：Functional Options（`WithWriteTimeout`）
 
 ## 3. 快速开始
@@ -86,7 +86,6 @@
 package demo
 
 import (
-    "net/http"
     "time"
 
     "github.com/gin-gonic/gin"
@@ -297,11 +296,15 @@ es.addEventListener('close', () => es.close());
 
 | 判定 | 含义 | 建议处理 |
 |---|---|---|
-| `errors.Is(err, ssex.ErrClientGone)` | 客户端已断开 | 静默结束，并取消上游请求（如正在进行的大模型调用）以停止计费 |
-| `errors.Is(err, ssex.ErrStreamClosed)` | 自己已 `Close` 过 | 调用顺序问题，检查业务逻辑 |
-| 其余 | 真实写失败（写超时、序列化失败等） | 记录日志 / 告警 |
+| `ErrClientGone` | 客户端已断开 | 静默结束，并取消上游请求（如正在进行的大模型调用）以停止计费 |
+| `ErrStreamClosed` | 自己已 `Close` 过 | 调用顺序问题，检查业务逻辑 |
+| `ErrInvalidArgument` | 参数非法：字段值含换行/NUL、`retry` 为负、心跳间隔非正 | 编程错误；此时响应头尚未提交，可改回普通 JSON |
+| `ErrWriteTimeout` | 单帧写入超过 `WithWriteTimeout` | 客户端读取过慢，连接仍活着；按需告警 |
+| `ErrFrameTooLarge` | 解码时单帧超过 1MB | 上游异常或恶意，终止本次转发 |
+| 其余 | 真实写失败 | 记录日志 / 告警 |
 
 `ErrClientGone` 的错误链保留原因，因此 `errors.Is(err, context.Canceled)` 同样成立。
+写超时不会被判定为 `ErrClientGone`——慢客户端不等于断开。
 
 ```go
 for chunk := range upstream {
@@ -316,7 +319,12 @@ for chunk := range upstream {
 }
 ```
 
-注意：客户端读取过慢导致的**写超时不算断开**，归入真实写失败。
+**首帧失败仍可回 JSON**：`Stream` 的写方法先构造并校验完整帧，只有构造成功才提交响应头。
+因此首帧因 `ErrInvalidArgument` 或序列化失败而报错时 `Started()` 仍为 `false`，
+调用方可以改用普通 JSON 响应回错。
+
+**起流错误要处理**：`Start()` 与 `WriteHeaders()` 返回 `error`。纯推送型 handler
+起流失败（客户端已断开）时应直接返回，不必再进消费循环白等。
 
 ### 4.11 Option
 
@@ -360,7 +368,7 @@ for msg, err := range ssex.Decode(resp.Body) {
 
 `Message` 字段：`ID`、`Name`（`event:` 字段，空为默认事件）、`Data []byte`、`Retry`。
 
-严格按 WHATWG event stream 规范：
+按 WHATWG event stream 规范解析，实际行为如下：
 
 - 行分隔符支持 `CRLF` / `CR` / `LF`
 - 字段值**只剥掉冒号后的一个空格**——大模型的增量 token 常以空格开头，多剥会损坏拼出的文本
@@ -369,8 +377,10 @@ for msg, err := range ssex.Decode(resp.Body) {
 - 帧是否产出以本帧是否出现过 `data` 字段为准（与浏览器 `EventSource` 一致），值为空串也照常产出
 - `ID` 与 `Retry` 是连接级状态，按规范跨帧沿用（`The buffer does not get reset`），转发时 id 连续性不会断；`Name` 每帧独立
 - 流尾残留的不完整帧（缺结尾空行）按规范丢弃，与浏览器一致——连接被掐断时残留字节通常是截断的半条 JSON
-- 单帧上限 1MB，超限报错而非静默截断
+- 单帧 `data` 累计上限 1MB（单行同上限），超限返回 `ErrFrameTooLarge` 而非静默截断
+- `retry` 只接受纯 ASCII 数字，且限制在不会让 `time.Duration` 溢出的范围内，超范围时忽略该字段
 - 读到流尾正常结束
+- 与规范的一处差异：`Data` 原样保留上游字节，不执行 UTF-8 解码替换。转发链路上改写字节会让服务端交给前端的内容与上游不一致，而浏览器接收端本身会按 UTF-8 解码；需要严格校验时自行处理 `Data`
 
 ### 4.14 `ssex.NewHub()` — 带外推送
 
@@ -420,12 +430,14 @@ func Subscribe(c *gin.Context) {
 | `Broadcast(event)` | 投给所有在线连接，返回 `(delivered, dropped)` |
 | `Online(key)` | 该 key 当前在线连接数 |
 | `WithQueueSize(n)` | 每连接队列容量，默认 32，非正值忽略 |
+| 返回值 | `Push` / `Broadcast` 返回 `(delivered, dropped)`：`dropped` 是被挤掉的**旧**事件数 |
 
-三条使用约束：
+四条使用约束：
 
-1. **先 `Start()` 再进消费循环**：纯推送型 handler 在第一条事件到来前不写字节，起流才能让前端及时拿到响应头并触发 `onopen`。
+1. **先 `Start()` 再进消费循环**：纯推送型 handler 在第一条事件到来前不写字节，起流才能让前端及时拿到响应头并触发 `onopen`；`Start()` 返回错误时直接返回，不必白等。
 2. **投递与写出分离**：`Push` 只把事件放进队列，写出由持有连接的 handler 完成，因此写动作始终发生在 handler 自己的 goroutine、`ResponseWriter` 仍有效的窗口内。
-3. **队列满即丢弃**：`dropped` 告诉你丢了多少，`Push` 立即返回。SSE 是状态推送，下一条状态本身就比重投的旧状态更新；要求必达的数据请落库，让客户端重连后拉快照。
+3. **队列满时保留最新（latest-wins）**：挤掉队首最旧的一条，让最新事件一定入队，`dropped` 是被挤掉的旧事件数。状态推送里最新一条描述的就是当前状态，必须送达。
+4. **适用边界**：Hub 面向**状态推送**——每条事件自带完整状态，丢掉中间过程无妨。AI token 流每一条都是文本的一部分，少一条就损坏输出，应在 handler 内直接用 `stream.Data` 写出，不经 Hub。
 
 消费循环用 `stream.Context().Done()` 退出，队列由 GC 回收。
 
@@ -439,7 +451,7 @@ func Subscribe(c *gin.Context) {
 
 - 客户端断开时（`ErrClientGone`）必须取消上游请求，否则前端关了页面你还在为它烧 token
 - 结束时用 `Close` 终止流，前端 `es.close()`，避免自动重连
-- 需要断线续传就用 `EventWithID` 带上 id，客户端重连时经 `LastEventID(c)` 读回起点，由业务决定从哪一条开始续推
+- 需要断线续传就用 `EventWithID` 带上 id，客户端重连时经 `LastEventID(r)` 读回起点，由业务决定从哪一条开始续推（见 6.7）
 
 ### 5.2 订单状态流
 
@@ -521,6 +533,45 @@ SSE 只适合：
 
 那应该考虑 WebSocket，而不是继续堆 SSE。
 
+### 6.7 断线续传以存储为事实源
+
+`LastEventID(r)` 只负责读回客户端的重连位点，重放数据从哪来由业务决定。可靠的做法：
+
+- 状态以数据库/缓存为**唯一事实源**，每次变更写入一个**单调递增的 revision**，并把它作为事件 id 下发（`EventWithID`）
+- 客户端重连时带回 `Last-Event-ID`，服务端据此从存储里取 `revision > LastEventID` 的记录补发
+- 顺序上**先订阅、后取快照**：反过来（先快照再订阅）会漏掉两步之间发生的变更
+- 先订阅时，快照的 revision 可能比队列里已有的事件旧，按 revision 取大者即可，别让旧事件覆盖新快照
+
+```go
+events, release := hub.Subscribe(uid)   // 先订阅
+defer release()
+
+snapshot := svc.Load(ctx, orderToken)   // 后取快照
+_ = stream.EventWithID(strconv.FormatInt(snapshot.Revision, 10), "status", snapshot)
+```
+
+### 6.8 浏览器接入：鉴权与 POST 流
+
+原生 `EventSource` 的构造参数只有 URL 与 `withCredentials`，不能携带自定义请求头，也不能发 POST body。据此选接入方式：
+
+| 场景 | 做法 |
+|---|---|
+| 登录态 / 订单状态（同源或可带 Cookie） | `new EventSource(url, { withCredentials: true })`，鉴权走 Cookie；服务端从 Cookie 解出用户 |
+| Bearer Token 鉴权 | 用 `fetch` + `ReadableStream` 自行读流，把 token 放进 `Authorization` 头 |
+| AI 对话（请求体较大，需 POST） | 同上用 `fetch`：`method: 'POST'` 发 body，响应仍是 `text/event-stream` |
+
+用 `fetch` 时前端需要自己解析帧（按空行分帧、`data:` 行以 `\n` 拼接），并自行实现重连——`EventSource` 的自动重连与 `Last-Event-ID` 回传都不再由浏览器代劳。服务端侧本包的输出格式不变。
+
+```js
+// Bearer Token / POST 流
+const resp = await fetch('/api/chat', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ prompt }),
+});
+const reader = resp.body.pipeThrough(new TextDecoderStream()).getReader();
+```
+
 ## 7. 测试
 
 当前公共层测试：
@@ -534,6 +585,8 @@ SSE 只适合：
 - [decode_test.go](./decode_test.go)
 - [hub_test.go](./hub_test.go)
 - [crossverify_test.go](./crossverify_test.go)
+- [reliability_test.go](./reliability_test.go)
+- [fuzz_test.go](./fuzz_test.go)
 - [example_test.go](./example_test.go)
 
 覆盖点包括：
@@ -550,9 +603,11 @@ SSE 只适合：
 - Hub：定向投递、同 key 多连接、注销幂等、广播、在线数、满队列丢弃计数、队列容量配置
 - 并发写入与 Hub 并发注册/推送（`-race`）、写入与解码热路径 benchmark
 - 交叉验证：写侧输出交由解码器解回（含两处帧注入交给解析器判决）、规范章节的官方示例向量、真实连接上客户端断开触发 `ErrClientGone`、Hub 与 Stream 真实连接端到端、真实 HTTP/2 连接
+- 可靠性：Hub latest-wins（最新状态送达、连续溢出只留最后一条、容量窗口）、帧构造失败时不提交响应头、起流错误可观察、整帧与单行大小上限、`retry` 溢出、非法 UTF-8 原样保留
+- Fuzz：`FuzzDecode` 与 `FuzzRoundTrip`（随机 CR/LF、非法 UTF-8、超大多行帧、超大 retry、提前停止迭代）
 
 ## 8. 依赖与版本
 
-- 直接依赖：`github.com/gtkit/json/v2`
+- 唯一直接依赖：`github.com/gtkit/json/v2`；`go mod graph` 里的其余条目均为它的传递依赖
 - 入口只用标准库 HTTP 接口，因此 net/http、gin、chi 共用同一套实现
 - 版本按 [SemVer](https://semver.org/lang/zh-CN/) 走，破坏性变更在 [CHANGELOG.md](./CHANGELOG.md) 以 ⚠ 标注并附迁移写法

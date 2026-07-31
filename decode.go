@@ -3,16 +3,25 @@ package ssex
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
+	"math"
 	"strconv"
 	"time"
 )
 
-// maxFrameSize 是单帧的字节上限。bufio.Scanner 默认 64KB 对含 base64 载荷的帧偏小;
-// 超限时返回错误而非静默截断。
+// maxFrameSize 是单帧 data 的字节上限,同时用作单行上限。
+//
+// 只靠 bufio.Scanner 的 buffer 上限不够:它约束的是单个 token,而这里的 token 是
+// scanFrameLines 切出的一行,由大量短 data: 行组成的一帧仍可让缓冲无限增长。
+// 因此另外累计整帧字节数。超限返回 ErrFrameTooLarge,不静默截断。
 const maxFrameSize = 1 << 20
+
+// maxRetryMillis 是 retry 字段允许的最大毫秒数:再大就会让
+// time.Duration(ms) * time.Millisecond 溢出成负值。
+const maxRetryMillis = uint64(math.MaxInt64 / int64(time.Millisecond))
 
 // bom 是 UTF-8 字节序标记,只可能出现在流首,不得进入字段名。
 var bom = []byte("\xef\xbb\xbf")
@@ -57,7 +66,13 @@ type Message struct {
 // 读取出错时产出一次该错误并终止;读到流尾正常结束,不产出 io.EOF。
 // 流尾残留的不完整帧(缺结尾空行)按规范丢弃,与浏览器一致——连接被中途掐断时,
 // 残留字节通常是截断的半条 JSON,交出去只会让前端解析失败。
-// 单帧超过 1MB 时产出错误,不静默截断。
+//
+// 单帧 data 累计超过 1MB(单行同上限)时产出可判定为 ErrFrameTooLarge 的错误,
+// 不静默截断。
+//
+// 与规范的一处差异:Data 原样保留上游字节,不执行 UTF-8 解码替换。
+// 转发链路上改写字节会让服务端交给前端的内容与上游不一致,而浏览器接收端
+// 本身会按 UTF-8 解码;需要严格校验的调用方可自行处理 Data。
 func Decode(r io.Reader) iter.Seq2[Message, error] {
 	return func(yield func(Message, error) bool) {
 		scanner := bufio.NewScanner(r)
@@ -65,9 +80,10 @@ func Decode(r io.Reader) iter.Seq2[Message, error] {
 		scanner.Split(scanFrameLines)
 
 		var (
-			msg   Message
-			data  []byte
-			first = true
+			msg       Message
+			data      []byte
+			frameSize int
+			first     = true
 		)
 
 		for scanner.Scan() {
@@ -91,7 +107,7 @@ func Decode(r io.Reader) iter.Seq2[Message, error] {
 				if !yield(msg, nil) {
 					return
 				}
-				msg.Name, msg.Data, data = "", nil, nil
+				msg.Name, msg.Data, data, frameSize = "", nil, nil, 0
 
 				continue
 			}
@@ -104,6 +120,14 @@ func Decode(r io.Reader) iter.Seq2[Message, error] {
 			case "event":
 				msg.Name = string(value)
 			case "data":
+				// 累计整帧字节数:单行上限拦不住"大量短 data 行 + 迟迟不发空行"。
+				frameSize += len(value) + 1
+				if frameSize > maxFrameSize {
+					yield(Message{}, fmt.Errorf("ssex: decode: %w: frame exceeds %d bytes",
+						ErrFrameTooLarge, maxFrameSize))
+
+					return
+				}
 				// value 指向 scanner 的复用缓冲,append 会拷贝内容,不会被下一行覆盖。
 				data = append(append(data, value...), '\n')
 			case "id":
@@ -118,6 +142,12 @@ func Decode(r io.Reader) iter.Seq2[Message, error] {
 		}
 
 		if err := scanner.Err(); err != nil {
+			// 单行超长与整帧超长归到同一个判定下,原因链保留 bufio.ErrTooLong。
+			if errors.Is(err, bufio.ErrTooLong) {
+				yield(Message{}, fmt.Errorf("ssex: decode: %w: %w", ErrFrameTooLarge, err))
+
+				return
+			}
 			yield(Message{}, fmt.Errorf("ssex: decode: %w", err))
 		}
 		// 流尾残留的不完整帧按规范丢弃:
@@ -171,8 +201,10 @@ func splitField(line []byte) (name string, value []byte) {
 	return string(field), value
 }
 
-// retryValue 解析 retry 字段:规范要求值全为 ASCII 数字,否则整个字段忽略
-// (strconv.Atoi 会接受 "+5" / "-5",不能直接用)。
+// retryValue 解析 retry 字段:规范要求值全为 ASCII 数字,否则整个字段忽略。
+//
+// 用 ParseUint 而非 Atoi:后者接受 "+5" / "-5" 这类带符号写法。
+// 另外必须卡上限,否则极大的合法数字乘以 time.Millisecond 会溢出成负的 Duration。
 func retryValue(v []byte) (time.Duration, bool) {
 	if len(v) == 0 {
 		return 0, false
@@ -182,8 +214,9 @@ func retryValue(v []byte) (time.Duration, bool) {
 			return 0, false
 		}
 	}
-	ms, err := strconv.Atoi(string(v))
-	if err != nil { // 超出 int 范围
+
+	ms, err := strconv.ParseUint(string(v), 10, 64)
+	if err != nil || ms > maxRetryMillis {
 		return 0, false
 	}
 

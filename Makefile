@@ -1,4 +1,4 @@
-.PHONY: tool fmt check test-integration tag release-patch release-minor gittag delcommit
+.PHONY: tool fmt check tag release-patch release-minor gittag delcommit
 #########################################
 #### 这是一个标准的发版 Makefile，包含 release-patch / release-minor / gittag / delcommit
 ########################################
@@ -15,13 +15,8 @@ BUMP              ?= patch
 RELEASE_REMOTE    ?= gtkit
 COVERAGE_MIN      ?= 80
 REQUIRE_CHANGELOG ?= 1
-EXTRA_TEST_TARGET ?= test-integration
+EXTRA_TEST_TARGET ?=
 
-# 真实 MySQL 集成测试（发布前置条件）：fake driver 只能验 SQL 形状，
-# DISTINCT / ONLY_FULL_GROUP_BY / 保留字 / Join 同名列必须由真实数据库判定。
-# DSN 允许覆盖（不同机器不同实例）；运行开关在 tag 门禁里硬编码为 1，
-# 防止 shell 里 export ORM_RUN_INTEGRATION=0 让集成测试被静默跳过却照常打 tag。
-ORM_TEST_DSN ?= root:@tcp(127.0.0.1:3306)/
 
 tool: ## 只读静态检查（不修改代码，格式化用 make fmt）
 	@ echo "▶️ golangci-lint run"
@@ -34,10 +29,6 @@ tool: ## 只读静态检查（不修改代码，格式化用 make fmt）
 
 fmt: ## 按 gofumpt 格式化代码（唯一允许写文件的格式化入口）
 	gofumpt -l -w .
-
-test-integration: ## 跑真实 MySQL 集成测试（需可连接的 MySQL；缺条件即失败，不静默跳过）
-	ORM_RUN_INTEGRATION=1 ORM_REQUIRE_INTEGRATION=1 ORM_TEST_DSN='$(ORM_TEST_DSN)' \
-	  go test -tags integration -race -count=1 -timeout=5m ./...
 
 ## govulncheck 检查漏洞 go install golang.org/x/vuln/cmd/govulncheck@latest
 check:

@@ -239,7 +239,7 @@ func TestWriteHeadersProtocolAware(t *testing.T) {
 
 	// HTTP/1.1:有 Connection
 	rec1 := httptest.NewRecorder()
-	New(rec1, newTestRequest()).WriteHeaders()
+	_ = New(rec1, newTestRequest()).WriteHeaders()
 	if got := rec1.Header().Get("Connection"); got != "keep-alive" {
 		t.Fatalf("HTTP/1 Connection = %q, want keep-alive", got)
 	}
@@ -248,7 +248,7 @@ func TestWriteHeadersProtocolAware(t *testing.T) {
 	rec2 := httptest.NewRecorder()
 	req2 := newTestRequest()
 	req2.Proto, req2.ProtoMajor, req2.ProtoMinor = "HTTP/2.0", 2, 0
-	New(rec2, req2).WriteHeaders()
+	_ = New(rec2, req2).WriteHeaders()
 	if got := rec2.Header().Get("Connection"); got != "" {
 		t.Fatalf("HTTP/2 Connection = %q, want empty", got)
 	}

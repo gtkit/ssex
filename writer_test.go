@@ -16,7 +16,7 @@ func TestWriterWriteHeadersAndEvent(t *testing.T) {
 	t.Parallel()
 
 	writer, recorder := newTestWriter(t)
-	writer.WriteHeaders()
+	_ = writer.WriteHeaders()
 	if err := writer.Event("chunk", map[string]any{
 		"session_id": "s1",
 		"delta":      "hello",
@@ -73,7 +73,7 @@ func TestWriterSurvivesServerWriteTimeout(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
 		writer := New(w, r)
-		writer.WriteHeaders()
+		_ = writer.WriteHeaders()
 
 		ticker := time.NewTicker(writeTimeout / 2)
 		defer ticker.Stop()
@@ -148,7 +148,7 @@ func TestWriteHeadersFlushesImmediately(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
 		stream := NewStream(w, r)
-		stream.Start()
+		_ = stream.Start()
 		time.Sleep(firstFrameDelay)
 		_ = stream.Event("chunk", map[string]string{"delta": "hi"})
 	})
@@ -175,7 +175,7 @@ func TestWriterCommentAndRetry(t *testing.T) {
 	t.Parallel()
 
 	writer, recorder := newTestWriter(t)
-	writer.WriteHeaders()
+	_ = writer.WriteHeaders()
 	if err := writer.Comment("keepalive"); err != nil {
 		t.Fatalf("Comment() error = %v", err)
 	}

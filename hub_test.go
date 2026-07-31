@@ -94,20 +94,65 @@ func TestHubBroadcast(t *testing.T) {
 	}
 }
 
-// TestHubDropsWhenQueueFull 验证慢消费者只丢自己的事件,不阻塞推送方。
-func TestHubDropsWhenQueueFull(t *testing.T) {
+// TestHubLatestWinsOnFullQueue 验证队列满时挤掉最旧的一条,让最新状态一定送达。
+//
+// 回归场景:此前实现丢弃新事件、保留旧事件——订单的 paid、登录的 logged_in
+// 会被丢掉,客户端却继续收到旧的 pending,停在错误状态上。
+func TestHubLatestWinsOnFullQueue(t *testing.T) {
 	t.Parallel()
 	hub := NewHub(WithQueueSize(1))
 
-	_, release := hub.Subscribe("u1")
+	events, release := hub.Subscribe("u1")
 	defer release()
 
-	if delivered, dropped := hub.Push("u1", Event{Name: "1"}); delivered != 1 || dropped != 0 {
+	if delivered, dropped := hub.Push("u1", Event{Name: "status", Data: "pending"}); delivered != 1 || dropped != 0 {
 		t.Fatalf("first Push() = (%d, %d), want (1, 0)", delivered, dropped)
 	}
-	for i := range 2 {
-		if delivered, dropped := hub.Push("u1", Event{}); delivered != 0 || dropped != 1 {
-			t.Fatalf("Push() #%d = (%d, %d), want (0, 1)", i+2, delivered, dropped)
+	if delivered, dropped := hub.Push("u1", Event{Name: "status", Data: "paid"}); delivered != 1 || dropped != 1 {
+		t.Fatalf("second Push() = (%d, %d), want (1, 1)", delivered, dropped)
+	}
+
+	// 消费方读到的必须是最新状态,而不是被挤掉的旧状态
+	if got := <-events; got.Data != "paid" {
+		t.Fatalf("event = %+v, want the latest status paid", got)
+	}
+}
+
+func TestHubKeepsOnlyLatestOnRepeatedOverflow(t *testing.T) {
+	t.Parallel()
+	hub := NewHub(WithQueueSize(1))
+
+	events, release := hub.Subscribe("u1")
+	defer release()
+
+	for _, status := range []string{"s1", "s2", "s3"} {
+		hub.Push("u1", Event{Data: status})
+	}
+
+	if got := <-events; got.Data != "s3" {
+		t.Fatalf("event = %+v, want s3", got)
+	}
+	select {
+	case extra := <-events:
+		t.Fatalf("queue should hold exactly one event, got extra %+v", extra)
+	default:
+	}
+}
+
+func TestHubKeepsLatestWindow(t *testing.T) {
+	t.Parallel()
+	hub := NewHub(WithQueueSize(2))
+
+	events, release := hub.Subscribe("u1")
+	defer release()
+
+	for _, status := range []string{"s1", "s2", "s3"} {
+		hub.Push("u1", Event{Data: status})
+	}
+
+	for _, want := range []string{"s2", "s3"} {
+		if got := <-events; got.Data != want {
+			t.Fatalf("event = %+v, want %s", got, want)
 		}
 	}
 }
@@ -134,14 +179,15 @@ func TestWithQueueSize(t *testing.T) {
 			_, release := hub.Subscribe("u1")
 			defer release()
 
-			// 不消费的前提下恰好能投递 want 条,第 want+1 条被丢弃
+			// 不消费的前提下恰好能投递 want 条而不挤掉任何旧事件
 			for i := range tt.want {
-				if delivered, _ := hub.Push("u1", Event{}); delivered != 1 {
-					t.Fatalf("Push() #%d delivered = %d, want 1", i+1, delivered)
+				if delivered, dropped := hub.Push("u1", Event{}); delivered != 1 || dropped != 0 {
+					t.Fatalf("Push() #%d = (%d, %d), want (1, 0)", i+1, delivered, dropped)
 				}
 			}
-			if delivered, dropped := hub.Push("u1", Event{}); delivered != 0 || dropped != 1 {
-				t.Fatalf("Push() beyond capacity = (%d, %d), want (0, 1)", delivered, dropped)
+			// 再一条仍然送达,代价是挤掉队首最旧的一条
+			if delivered, dropped := hub.Push("u1", Event{}); delivered != 1 || dropped != 1 {
+				t.Fatalf("Push() beyond capacity = (%d, %d), want (1, 1)", delivered, dropped)
 			}
 		})
 	}

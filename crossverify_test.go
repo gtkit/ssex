@@ -269,7 +269,7 @@ func TestStreamOverHTTP2(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
 		stream := NewStream(w, r)
-		stream.Start()
+		_ = stream.Start()
 		if err := stream.Event("status", map[string]string{"status": "paid"}); err != nil {
 			t.Errorf("Event() over h2 failed: %v", err)
 
@@ -321,7 +321,7 @@ func TestHubStreamEndToEnd(t *testing.T) {
 		stream := NewStream(w, r)
 		// 必须先起流:纯推送型 handler 在收到第一条事件前不写任何字节,
 		// 不起流则客户端一直等响应头(实测会一直挂到超时)。
-		stream.Start()
+		_ = stream.Start()
 
 		events, release := hub.Subscribe("u1")
 		defer release()
