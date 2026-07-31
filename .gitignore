@@ -1,9 +1,22 @@
-.openspec-auto-backup/
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+credentials.*
 
-.openspec-auto/
-
+# OS / IDE
+.DS_Store
+.Ds_Store
 .idea/
 .vscode/
-.Ds_Store
-.DS_Store
+
+# 构建与测试产物
+bin/
+dist/
+build/
+coverage/
+coverage.out
 *.log

@@ -1,21 +1,15 @@
 package ssex
 
 import (
-	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/gin-gonic/gin"
 )
 
 // newTestStream 构造一个挂在 httptest recorder 上的 Stream。
 func newTestStream(recorder *httptest.ResponseRecorder) *Stream {
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodGet, "/sse", nil)
-	return NewStream(c)
+	return NewStream(recorder, newTestRequest())
 }
 
 // TestStreamConcurrentWrite 验证 Stream 用锁串行化后可从多个 goroutine 并发写入。
