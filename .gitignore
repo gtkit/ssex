@@ -1,0 +1,9 @@
+.openspec-auto-backup/
+
+.openspec-auto/
+
+.idea/
+.vscode/
+.Ds_Store
+.DS_Store
+*.log
