@@ -32,8 +32,10 @@ var ErrInvalidArgument = errors.New("ssex: invalid argument")
 // 通常意味着客户端读取过慢。它不等于客户端断开，因此不会被判定为 ErrClientGone。
 var ErrWriteTimeout = errors.New("ssex: write timeout")
 
-// ErrFrameTooLarge 表示解码时单帧字节数超过上限（1MB），用 errors.Is 判定。
-// 单行超长与多行 data 累计超长都归入本类。
+// ErrFrameTooLarge 表示解码时单帧的 data 超过上限，用 errors.Is 判定。
+//
+// 上限按产出的 Message.Data 大小计：最多 1048575 字节，单行与多行口径一致。
+// 单行长度另有一个略高的硬上限（防止超长行撑爆缓冲），越过它同样归入本类。
 var ErrFrameTooLarge = errors.New("ssex: frame too large")
 
 // invalidArgf 构造可判定为 ErrInvalidArgument 的参数错误。

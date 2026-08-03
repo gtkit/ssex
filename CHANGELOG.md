@@ -6,12 +6,16 @@
 
 ## [Unreleased]
 
+## [v0.2.1] - 2026-08-03
+
 ### Added
 
 - 新增 `gincompat/` 独立测试模块（自带 go.mod，主模块依赖清单因此仍不含任何 web 框架）：把 gin 集成做成可持续运行的回归测试，覆盖鉴权在起流前拒绝、快照+带外推送+终态 `Close`、心跳 goroutine 在 handler 返回前收尾、长连接不被 `http.Server.WriteTimeout` 截断、客户端断开判定、`Started()` 错误分界、应用停机收尾、与 Recovery / Logger 中间件共存。
 - README 新增「Gin 集成」一节：完整 handler 模板（鉴权 → 起流错误 → 先订阅后快照 → 心跳收尾 → 四出口事件循环）、以 `Started()` 分界的错误处理规范与错误分级、中间件兼容清单与路由组隔离、`c.Writer` 生命周期约束。
 
 ### Fixed
+- ⚠ 修正 README 错误表里 `ErrInvalidArgument` 的处理建议：表格无条件写着"响应头尚未提交、可改回普通 JSON"，但这只在**首帧**失败时成立。流已开始后出现非法帧时 `Started()` 仍为 true，照表调用 `c.JSON` 会产生损坏的响应。表格已加上 `Started()` 的条件限定。
+- 修正大模型转发模板会对已写超时的连接再写终止帧：原先先 `closeStream` 再判断心跳是否失败，而心跳已因 `ErrWriteTimeout` 失败时说明连接写不动了——这次额外写入最坏还要再等一个 `WithWriteTimeout` 才失败，拖慢失败连接的释放并产生重复告警。改为先看心跳：已失败则跳过终止帧。
 - ⚠ 修复大模型转发模板会遮蔽心跳写错误：心跳失败后 `cancel()` 上游，`Decode` 随即返回 context canceled 并被循环直接 `return`——放在循环之后的"优先检查心跳错误"根本执行不到，真正的 `ErrWriteTimeout` 被上游读错误盖住，生产上丢掉"这条连接写不动"的信号。两个出口现在都走 `finalErr`，由它在上游读错误与心跳写错误之间挑出该报告的那个。
 - ⚠ 修复大模型转发模板的 `http.Transport` 丢失标准库默认值：直接 `new(http.Transport)` 会丢掉 `ProxyFromEnvironment`（企业代理失效）、`ForceAttemptHTTP2`（自定义 `DialContext` 时不再尝试 HTTP/2）、`MaxIdleConns` / `IdleConnTimeout` / `ExpectContinueTimeout`。改为从 `http.DefaultTransport` 克隆后只覆盖阶段超时。
 - 修复解码 1MB 边界与公开契约不一致：`bufio.Scanner` 的 token 是一整行、含 `data: ` 前缀，前缀因此占掉了 data 的配额——实测 payload 到 1048569 字节可用、1048570 就被拒，而文档声明的是"data 内容累计 1MB"。行上限现在另留余量，是否超限统一由帧内累计判断决定，并新增 `TestDecodeFrameSizeBoundary` / `TestDecodeMultiLineBoundary` 钉住精确口径。
@@ -51,6 +55,8 @@
 - 修正 README 的心跳模板：原写法只发停止信号、不等 goroutine 退出。gin 的 `c.Writer` 是 `Context` 的内部字段，handler 返回后 `Context` 归还对象池并在下个请求中被重置，因此心跳 goroutine 若在 handler 返回后仍在写入，就会写到另一个请求的响应上。模板改为独立 ctx + `defer stop(); <-hbDone` 等待退出。
 
 ### Changed
+- 统一 1MB 边界的对外口径：改为按产出的 `Message.Data` 大小声明（最多 1048575 字节），单行与多行一致，`maxFrameSize` 只描述内部拼接缓冲。此前文档在"内部缓冲"与"最终 Data 大小"两个口径间摇摆，实测两者恒差 1 字节。`decode.go` / `errors.go` / README 三处同步。
+- 明确导出 API 的 nil 参数契约：`Decode(r)`、`LastEventID(r)`、`New(w, r)`、`NewStream(w, r)`、`Heartbeat(ctx, …)` 的相应参数必须非 nil。库选择 fail fast 而非防御性降级——一个读不到内容的 `Decode` 或写不出字节的 `Writer` 会把故障伪装成"上游没输出""客户端没收到"，比 panic 难定位。GoDoc 与 README 写明，并加 `TestNilArgumentsPanic` 固定该行为，防止将来出现部分函数防御、部分不防御的不一致。
 - 发版门禁纳入 gin 兼容性回归：`EXTRA_TEST_TARGET` 指向新增的 `make test-gincompat`，此前它为空，`make release-patch` 不会跑独立的 `gincompat` 模块——对一个主要给 gin 使用的库，这是发布前最大的门禁缺口。
 - CI 增加 tag 触发（`tags: ["v*"]`），使发版推送的标签也有一份对应版本的 CI 记录；覆盖率步骤由"只打印"改为低于 80% 即失败，与发版脚本的 `COVERAGE_MIN` 对齐。
 - `Hub.Online` 的定位改为"监控与近似判断"：它只是某个时刻单个 key 的快照，也不提供全局在线总数，`if Online(key) < limit { Subscribe(key) }` 是非原子的 check-then-act，并发请求照样突破上限。严格限流应由应用级 semaphore、原子计数器或网关完成（GoDoc 与 README 6.10 同步）。

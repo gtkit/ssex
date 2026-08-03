@@ -132,7 +132,7 @@ func StreamDemo(w http.ResponseWriter, r *http.Request) {
 
 ### 4.1 `NewStream(w, r)`
 
-创建一个业务层友好的 SSE 输出器。
+创建一个业务层友好的 SSE 输出器。`w` 与 `r` 都必须非 nil——传 nil 是编程错误，库不做防御性降级，因为一个写不出字节的 `Stream` 比直接 panic 难定位得多。同理 `Decode(r)` 的 `r`、`LastEventID(r)` 的 `r`、`Heartbeat(ctx, …)` 的 `ctx` 都必须非 nil。
 
 ```go
 stream := ssex.NewStream(c.Writer, c.Request)
@@ -314,7 +314,7 @@ func closeStream(stream *ssex.Stream, payload any) {
 |---|---|---|
 | `ErrClientGone` | 客户端已断开 | 静默结束，并取消上游请求（如正在进行的大模型调用）以停止计费 |
 | `ErrStreamClosed` | 自己已 `Close` 过 | 调用顺序问题，检查业务逻辑 |
-| `ErrInvalidArgument` | 参数非法：字段值含换行/NUL、`retry` 为负、心跳间隔非正 | 编程错误；此时响应头尚未提交，可改回普通 JSON |
+| `ErrInvalidArgument` | 参数非法：字段值含换行/NUL、`retry` 为负、心跳间隔非正 | 编程错误。**仅当 `Started()` 为 false 时**（即首帧就失败）响应头尚未提交、可改回普通 JSON；流已开始后它只表示这一帧被拒，此时**不能**再写普通响应体 |
 | `ErrWriteTimeout` | 单帧写入超过 `WithWriteTimeout` | 客户端读取过慢，连接仍活着；按需告警 |
 | `ErrFrameTooLarge` | 解码时单帧超过 1MB | 上游异常或恶意，终止本次转发 |
 | 其余 | 真实写失败 | 记录日志 / 告警 |
@@ -411,7 +411,7 @@ for msg, err := range ssex.Decode(resp.Body) {
 - 帧是否产出以本帧是否出现过 `data` 字段为准（与浏览器 `EventSource` 一致），值为空串也照常产出
 - `ID` 与 `Retry` 是连接级状态，按规范跨帧沿用（`The buffer does not get reset`），转发时 id 连续性不会断；`Name` 每帧独立
 - 流尾残留的不完整帧（缺结尾空行）按规范丢弃，与浏览器一致——连接被掐断时残留字节通常是截断的半条 JSON
-- 单帧 `data` 累计上限 1MB（单行同上限），超限返回 `ErrFrameTooLarge` 而非静默截断
+- 产出的 `Message.Data` 最多 1048575 字节，超限返回 `ErrFrameTooLarge` 而非静默截断；单行与多行同一口径（多行按拼接后的长度算），单行长度另有一个略高的硬上限防止超长行撑爆缓冲
 - `retry` 只接受纯 ASCII 数字，且限制在不会让 `time.Duration` 溢出的范围内，超范围时忽略该字段
 - 读到流尾正常结束
 - 与规范的一处差异：`Data` 原样保留上游字节，不执行 UTF-8 解码替换。转发链路上改写字节会让服务端交给前端的内容与上游不一致，而浏览器接收端本身会按 UTF-8 解码；需要严格校验时自行处理 `Data`
@@ -637,11 +637,7 @@ defer func() {
 var completed bool
 for msg, err := range ssex.Decode(resp.Body) {
     if err != nil {
-        // 心跳失败会 cancel 上游，于是这里拿到的往往是 context canceled——
-        // 那只是表象，真正的原因是下游写不出去。所以要先看心跳错误。
-        closeStream(stream, gin.H{"reason": "incomplete"})
-
-        return finalErr(err, hbErr)
+        return finish(stream, hbErr, "incomplete", err)
     }
     if string(msg.Data) == "[DONE]" {
         completed = true
@@ -662,22 +658,24 @@ for msg, err := range ssex.Decode(resp.Body) {
 if !completed {
     // 让前端能区分"生成完成"与"被截断"：终止原因不同，前端可以据此提示重试，
     // 而不是把半截回答当成最终答案。
-    closeStream(stream, gin.H{"reason": "incomplete"})
-
-    return finalErr(errors.New("上游未返回结束哨兵，输出可能被截断"), hbErr)
+    return finish(stream, hbErr, "incomplete", errors.New("上游未返回结束哨兵，输出可能被截断"))
 }
 closeStream(stream, gin.H{"reason": "done"}) // 终止帧失败要能发现，见 4.9
 ```
 
-两个出口都走 `finalErr`，它负责在"上游读错误"与"心跳写错误"之间挑出真正该报告的那个：
+两个异常出口都走 `finish`，它同时解决两件事：报告哪个错误、还要不要写终止帧。
 
 ```go
-// finalErr 决定最终报告哪个错误。
+// finish 在转发异常结束时收尾。
 //
-// 心跳失败时会 cancel 上游，因此上游返回的 context canceled 只是连带结果；
-// 真正的原因是下游写不出去。若不优先取心跳错误，ErrWriteTimeout 会被上游的
-// 读错误遮蔽，生产上就丢掉了"这条连接写不动"这个关键信号。
-func finalErr(cause error, hbErr <-chan error) error {
+// 先看心跳，有两个原因：
+//
+//  1. 心跳失败会 cancel 上游，因此上游返回的 context canceled 只是连带结果，
+//     真正的原因是下游写不出去。不优先取心跳错误，ErrWriteTimeout 就会被上游
+//     读错误遮蔽，生产上丢掉"这条连接写不动"的信号。
+//  2. 心跳失败说明连接已经写不动了，此时再写终止帧只会白等一个 WithWriteTimeout
+//     才失败，拖慢这条失败连接的释放，还会产生一次重复告警。所以直接跳过 closeStream。
+func finish(stream *ssex.Stream, hbErr <-chan error, reason string, cause error) error {
     select {
     case hbFail := <-hbErr:
         if errors.Is(hbFail, ssex.ErrClientGone) || errors.Is(hbFail, context.Canceled) {
@@ -687,6 +685,8 @@ func finalErr(cause error, hbErr <-chan error) error {
         return hbFail
     default:
     }
+
+    closeStream(stream, gin.H{"reason": reason})
 
     return cause
 }

@@ -53,6 +53,9 @@ func Raw(data string) any {
 // New 创建一个 SSE Writer；可用 Option 调整写入行为。
 //
 // gin 里这样调用：ssex.New(c.Writer, c.Request)。
+//
+// w 与 r 都必须非 nil。传 nil 是调用方的编程错误，后续写入会 panic——
+// 库不为此做防御性降级：一个写不出任何字节的 Writer 比直接 panic 更难定位。
 func New(w http.ResponseWriter, r *http.Request, opts ...Option) *Writer {
 	return &Writer{w: w, r: r, writeTimeout: newOptions(opts).writeTimeout}
 }
@@ -310,6 +313,8 @@ func (w *Writer) checkAlive(op string) error {
 
 // LastEventID 返回 EventSource 自动重连时携带的 `Last-Event-ID` 请求头
 // （即客户端最后收到的 EventWithID 的 id），无则返回空串。
+//
+// r 必须非 nil。
 // 服务端据此决定断线续推的起点,由业务选择从哪一条开始重放。
 func LastEventID(r *http.Request) string {
 	return r.Header.Get("Last-Event-ID")

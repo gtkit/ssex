@@ -31,6 +31,8 @@ type Stream struct {
 // NewStream 创建一个 SSE Stream；可用 Option 调整写入行为。
 //
 // gin 里这样调用：ssex.NewStream(c.Writer, c.Request)。
+//
+// w 与 r 都必须非 nil，理由见 New。
 func NewStream(w http.ResponseWriter, r *http.Request, opts ...Option) *Stream {
 	return &Stream{writer: New(w, r, opts...)}
 }
@@ -121,6 +123,7 @@ func (s *Stream) Retry(milliseconds int) error {
 // 长时间无数据的流（等支付结果、等登录态）必须有心跳，否则代理层会按空闲连接断开。
 // ctx 取消时返回 ctx 错误；客户端断开返回 ErrClientGone；流已终止返回 ErrStreamClosed。
 // interval 非正时立即返回 ErrInvalidArgument，不写出任何字节。
+// ctx 必须非 nil：传 nil 会在 select 时 panic，而不是变成一个永不退出的心跳。
 func (s *Stream) Heartbeat(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		return invalidArgf("ssex: heartbeat interval must be positive: %s", interval)

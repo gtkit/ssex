@@ -12,15 +12,18 @@ import (
 	"time"
 )
 
-// maxFrameSize 是单帧 data 内容的字节上限。
+// maxFrameSize 是解码单帧时内部拼接缓冲的字节上限。
 //
-// 计法:每个 data 行按 len(值) + 1 计入(+1 是多行拼接时的换行),累计超过它就返回
-// ErrFrameTooLarge。因此单行 data 最多可用 maxFrameSize - 1 字节。
+// 对调用方而言更直接的口径是 maxDataSize:产出的 Message.Data 最多这么多字节。
+// 两者恒差 1——拼接时每个 data 行都补一个换行,派发前再去掉末尾那个。
 //
 // 只靠 bufio.Scanner 的 buffer 上限不够:它约束的是单个 token,而这里的 token 是
 // scanFrameLines 切出的一行,由大量短 data: 行组成的一帧仍可让缓冲无限增长。
 // 因此另外累计整帧字节数。
 const maxFrameSize = 1 << 20
+
+// maxDataSize 是产出的 Message.Data 的字节上限,也是文档对外声明的口径。
+const maxDataSize = maxFrameSize - 1
 
 // maxLineSize 是单行的字节上限,给字段前缀留出余量。
 //
@@ -77,9 +80,12 @@ type Message struct {
 // 流尾残留的不完整帧(缺结尾空行)按规范丢弃,与浏览器一致——连接被中途掐断时,
 // 残留字节通常是截断的半条 JSON,交出去只会让前端解析失败。
 //
-// 单帧 data 内容累计超过 1MB 时产出可判定为 ErrFrameTooLarge 的错误,不静默截断。
-// 精确口径:每个 data 行按 len(值) + 1 计入(+1 是多行拼接的换行),因此单行 data
-// 最多可用 1048575 字节;单行长度另有一个略高的硬上限,防止超长行撑爆缓冲。
+// 产出的 Message.Data 最多 1048575 字节(maxDataSize);超过即产出可判定为
+// ErrFrameTooLarge 的错误,不静默截断。这个口径对单行与多行一致——多行时按
+// 各 data 行拼接后的长度算。单行长度另有一个略高的硬上限,防止超长行撑爆缓冲。
+//
+// r 必须非 nil。nil 是调用方的编程错误,迭代时会 panic 而不是静默产出空流——
+// 静默降级会把"上游连接没建起来"伪装成"上游没有输出"。
 //
 // 与规范的一处差异:Data 原样保留上游字节,不执行 UTF-8 解码替换。
 // 转发链路上改写字节会让服务端交给前端的内容与上游不一致,而浏览器接收端
@@ -134,8 +140,8 @@ func Decode(r io.Reader) iter.Seq2[Message, error] {
 				// 累计整帧字节数:单行上限拦不住"大量短 data 行 + 迟迟不发空行"。
 				frameSize += len(value) + 1
 				if frameSize > maxFrameSize {
-					yield(Message{}, fmt.Errorf("ssex: decode: %w: frame exceeds %d bytes",
-						ErrFrameTooLarge, maxFrameSize))
+					yield(Message{}, fmt.Errorf("ssex: decode: %w: data exceeds %d bytes",
+						ErrFrameTooLarge, maxDataSize))
 
 					return
 				}
