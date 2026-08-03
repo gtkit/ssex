@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+    # 也在 tag 上跑：发版脚本推 tag 后立即有一份对应版本的 CI 记录
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -33,10 +35,13 @@ jobs:
       - name: Test
         run: go test -race -count=1 -timeout=8m ./...
 
+      # 与发版脚本的 COVERAGE_MIN 保持一致：低于门槛要让 CI 红，而不是只打印
       - name: Coverage
         run: |
           go test -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tail -1
+          cov=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          awk -v c="$cov" 'BEGIN { if (c+0 < 80) { printf "✗ 覆盖率 %.1f%% < 80%%\n", c+0; exit 1 } }' 
 
       - name: Benchmark
         run: go test -bench=. -benchmem -run='^$' ./...

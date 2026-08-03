@@ -317,3 +317,71 @@ func TestDecodePreservesInvalidUTF8(t *testing.T) {
 		t.Fatalf("data = %q, want %q", msgs[0].Data, raw)
 	}
 }
+
+// TestDecodeFrameSizeBoundary 钉住 1MB 边界的精确契约。
+//
+// 回归场景：Scanner 的 token 是一整行、含 "data: " 前缀，若直接把 maxFrameSize
+// 当行上限，前缀会占掉 data 的配额——实测 payload 到 maxFrameSize-7 就被拒了，
+// 而文档声明的是"data 内容累计 1MB"。现在行上限另留余量，超限一律由 frameSize
+// 的累计判断决定，单行可用字节因此与声明一致。
+func TestDecodeFrameSizeBoundary(t *testing.T) {
+	t.Parallel()
+
+	// 每个 data 行按 len(值)+1 计入，因此单行最大可用 maxFrameSize-1
+	const maxSingleLine = maxFrameSize - 1
+
+	tests := []struct {
+		name    string
+		payload int
+		wantErr bool
+	}{
+		{"单行恰好用满", maxSingleLine, false},
+		{"单行超出一字节", maxSingleLine + 1, true},
+		{"单行远超上限", maxFrameSize + 4096, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			msgs, err := collectMessages(t, "data: "+strings.Repeat("x", tt.payload)+"\n\n")
+			if tt.wantErr {
+				if !errors.Is(err, ErrFrameTooLarge) {
+					t.Fatalf("payload=%d error = %v, want ErrFrameTooLarge", tt.payload, err)
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatalf("payload=%d error = %v, want nil", tt.payload, err)
+			}
+			if len(msgs) != 1 || len(msgs[0].Data) != tt.payload {
+				t.Fatalf("payload=%d 解出 %d 帧、data 长度 %d", tt.payload, len(msgs), len(msgs[0].Data))
+			}
+		})
+	}
+}
+
+// TestDecodeMultiLineBoundary 验证多行累计与单行用同一口径。
+func TestDecodeMultiLineBoundary(t *testing.T) {
+	t.Parallel()
+
+	// 每行 value 长 1023，计入 1024；正好 1024 行时累计 = maxFrameSize
+	const perLine = 1023
+	line := "data: " + strings.Repeat("y", perLine) + "\n"
+	rows := maxFrameSize / (perLine + 1)
+
+	var sb strings.Builder
+	for range rows {
+		sb.WriteString(line)
+	}
+
+	if _, err := collectMessages(t, sb.String()+"\n"); err != nil {
+		t.Fatalf("累计恰好用满时 error = %v, want nil", err)
+	}
+
+	// 再加一行就超
+	if _, err := collectMessages(t, sb.String()+line+"\n"); !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("累计超限 error = %v, want ErrFrameTooLarge", err)
+	}
+}

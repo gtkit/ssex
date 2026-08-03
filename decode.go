@@ -12,12 +12,22 @@ import (
 	"time"
 )
 
-// maxFrameSize 是单帧 data 的字节上限,同时用作单行上限。
+// maxFrameSize 是单帧 data 内容的字节上限。
+//
+// 计法:每个 data 行按 len(值) + 1 计入(+1 是多行拼接时的换行),累计超过它就返回
+// ErrFrameTooLarge。因此单行 data 最多可用 maxFrameSize - 1 字节。
 //
 // 只靠 bufio.Scanner 的 buffer 上限不够:它约束的是单个 token,而这里的 token 是
 // scanFrameLines 切出的一行,由大量短 data: 行组成的一帧仍可让缓冲无限增长。
-// 因此另外累计整帧字节数。超限返回 ErrFrameTooLarge,不静默截断。
+// 因此另外累计整帧字节数。
 const maxFrameSize = 1 << 20
+
+// maxLineSize 是单行的字节上限,给字段前缀留出余量。
+//
+// Scanner 的 token 是一整行,含 "data: " 这样的前缀;若直接用 maxFrameSize 当行上限,
+// 前缀就会占掉 data 的配额——实测 payload 到 maxFrameSize-7 就被 Scanner 拒了,
+// 与上面声明的口径不符。留出余量后,是否超限统一由 frameSize 的累计判断决定。
+const maxLineSize = maxFrameSize + 64
 
 // maxRetryMillis 是 retry 字段允许的最大毫秒数:再大就会让
 // time.Duration(ms) * time.Millisecond 溢出成负值。
@@ -67,8 +77,9 @@ type Message struct {
 // 流尾残留的不完整帧(缺结尾空行)按规范丢弃,与浏览器一致——连接被中途掐断时,
 // 残留字节通常是截断的半条 JSON,交出去只会让前端解析失败。
 //
-// 单帧 data 累计超过 1MB(单行同上限)时产出可判定为 ErrFrameTooLarge 的错误,
-// 不静默截断。
+// 单帧 data 内容累计超过 1MB 时产出可判定为 ErrFrameTooLarge 的错误,不静默截断。
+// 精确口径:每个 data 行按 len(值) + 1 计入(+1 是多行拼接的换行),因此单行 data
+// 最多可用 1048575 字节;单行长度另有一个略高的硬上限,防止超长行撑爆缓冲。
 //
 // 与规范的一处差异:Data 原样保留上游字节,不执行 UTF-8 解码替换。
 // 转发链路上改写字节会让服务端交给前端的内容与上游不一致,而浏览器接收端
@@ -76,7 +87,7 @@ type Message struct {
 func Decode(r io.Reader) iter.Seq2[Message, error] {
 	return func(yield func(Message, error) bool) {
 		scanner := bufio.NewScanner(r)
-		scanner.Buffer(make([]byte, 0, 4096), maxFrameSize)
+		scanner.Buffer(make([]byte, 0, 4096), maxLineSize)
 		scanner.Split(scanFrameLines)
 
 		var (

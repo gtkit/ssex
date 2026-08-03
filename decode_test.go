@@ -307,15 +307,24 @@ func TestDecodeReadError(t *testing.T) {
 	}
 }
 
+// TestDecodeFrameTooLong 覆盖两条超限路径,它们都必须归入 ErrFrameTooLarge:
+// 帧内 data 累计超限由 frameSize 判断拦下,单行长度超过硬上限由 Scanner 拦下。
 func TestDecodeFrameTooLong(t *testing.T) {
 	t.Parallel()
 
+	// 路径一:data 内容超过帧上限(行长仍在 maxLineSize 之内)
 	_, err := collectMessages(t, "data: "+strings.Repeat("x", maxFrameSize+1)+"\n\n")
-	if err == nil {
-		t.Fatal("Decode() error = nil, want frame too long error")
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("帧内累计超限 error = %v, want ErrFrameTooLarge", err)
+	}
+
+	// 路径二:单行长度超过硬上限,由 Scanner 拦下并保留原因链
+	_, err = collectMessages(t, "data: "+strings.Repeat("x", maxLineSize+1)+"\n\n")
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("超长行 error = %v, want ErrFrameTooLarge", err)
 	}
 	if !errors.Is(err, bufio.ErrTooLong) {
-		t.Fatalf("error = %v, want bufio.ErrTooLong", err)
+		t.Fatalf("超长行 error = %v, 原因链应保留 bufio.ErrTooLong", err)
 	}
 }
 

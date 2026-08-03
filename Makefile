@@ -1,4 +1,4 @@
-.PHONY: tool fmt check tag release-patch release-minor gittag delcommit
+.PHONY: tool fmt check test-gincompat tag release-patch release-minor gittag delcommit
 #########################################
 #### 这是一个标准的发版 Makefile，包含 release-patch / release-minor / gittag / delcommit
 ########################################
@@ -15,7 +15,7 @@ BUMP              ?= patch
 RELEASE_REMOTE    ?= gtkit
 COVERAGE_MIN      ?= 80
 REQUIRE_CHANGELOG ?= 1
-EXTRA_TEST_TARGET ?=
+EXTRA_TEST_TARGET ?= test-gincompat
 
 
 tool: ## 只读静态检查（不修改代码，格式化用 make fmt）
@@ -29,6 +29,9 @@ tool: ## 只读静态检查（不修改代码，格式化用 make fmt）
 
 fmt: ## 按 gofumpt 格式化代码（唯一允许写文件的格式化入口）
 	gofumpt -l -w .
+
+test-gincompat: ## 跑 gin 兼容性回归（独立模块，主模块依赖清单因此不含 gin）
+	cd gincompat && go vet ./... && go test -race -count=1 -timeout=5m ./...
 
 ## govulncheck 检查漏洞 go install golang.org/x/vuln/cmd/govulncheck@latest
 check:

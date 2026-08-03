@@ -557,12 +557,21 @@ AI 对话流在 handler 内直连上游、不经 Hub，因此不受这条限制�
 ```go
 // 全局复用一个客户端。Timeout 留零值，改为限制建连、TLS 与等响应头这三个阶段；
 // "最长生成时长"由业务用 context.WithTimeout 单独控制。
-var upstreamClient = &http.Client{
-    Transport: &http.Transport{
-        DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-        TLSHandshakeTimeout:   5 * time.Second,
-        ResponseHeaderTimeout: 30 * time.Second, // 首个响应头就绪的上限，不含流式响应体
-    },
+//
+// 必须从 DefaultTransport 克隆再覆盖，不要自己 new(http.Transport)——后者会丢掉
+// ProxyFromEnvironment（企业代理失效）、ForceAttemptHTTP2（自定义 DialContext 时
+// 不再尝试 HTTP/2）、MaxIdleConns / IdleConnTimeout / ExpectContinueTimeout 等
+// 标准库调好的默认值。
+var upstreamClient = &http.Client{Transport: newUpstreamTransport()}
+
+func newUpstreamTransport() *http.Transport {
+    tr := http.DefaultTransport.(*http.Transport).Clone()
+    tr.TLSHandshakeTimeout = 5 * time.Second
+    tr.ResponseHeaderTimeout = 30 * time.Second // 首个响应头就绪的上限，不含流式响应体
+    // 只调建连超时，保留 KeepAlive
+    tr.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+
+    return tr
 }
 ```
 
@@ -595,7 +604,14 @@ if err != nil || mediaType != "text/event-stream" {
     return fmt.Errorf("上游 Content-Type 非 SSE: %q", rawCT) // 上游报错时常返回 JSON
 }
 
-// 上游校验通过后启动心跳：模型思考、工具调用、上游暂时停顿期间下游一个字节
+// 上游校验通过、确定要开这条流了，显式起流把响应头发出去。
+// 不起流的话，响应头要等到第一个 token（可能几十秒）或第一次心跳才提交，
+// 前端迟迟不触发 onopen；而在这之前失败还能回普通 JSON。
+if err := stream.Start(); err != nil {
+    return err
+}
+
+// 起流之后启动心跳：模型思考、工具调用、上游暂时停顿期间下游一个字节
 // 都没有，网关 / CDN / Ingress 的空闲超时会在模型还在工作时掐断连接。
 //
 // 心跳失败要连带取消上游——转发循环阻塞在读上游，没法同时 select hbErr，
@@ -621,7 +637,11 @@ defer func() {
 var completed bool
 for msg, err := range ssex.Decode(resp.Body) {
     if err != nil {
-        return err
+        // 心跳失败会 cancel 上游，于是这里拿到的往往是 context canceled——
+        // 那只是表象，真正的原因是下游写不出去。所以要先看心跳错误。
+        closeStream(stream, gin.H{"reason": "incomplete"})
+
+        return finalErr(err, hbErr)
     }
     if string(msg.Data) == "[DONE]" {
         completed = true
@@ -639,27 +659,37 @@ for msg, err := range ssex.Decode(resp.Body) {
     }
 }
 
-// 心跳失败是循环退出的可能原因之一，优先按它报告
-select {
-case err := <-hbErr:
-    closeStream(stream, gin.H{"reason": "incomplete"})
-
-    if errors.Is(err, ssex.ErrClientGone) || errors.Is(err, context.Canceled) {
-        return nil // 下游已断开，正常收尾
-    }
-
-    return err
-default:
-}
-
 if !completed {
     // 让前端能区分"生成完成"与"被截断"：终止原因不同，前端可以据此提示重试，
     // 而不是把半截回答当成最终答案。
     closeStream(stream, gin.H{"reason": "incomplete"})
 
-    return errors.New("上游未返回结束哨兵，输出可能被截断")
+    return finalErr(errors.New("上游未返回结束哨兵，输出可能被截断"), hbErr)
 }
 closeStream(stream, gin.H{"reason": "done"}) // 终止帧失败要能发现，见 4.9
+```
+
+两个出口都走 `finalErr`，它负责在"上游读错误"与"心跳写错误"之间挑出真正该报告的那个：
+
+```go
+// finalErr 决定最终报告哪个错误。
+//
+// 心跳失败时会 cancel 上游，因此上游返回的 context canceled 只是连带结果；
+// 真正的原因是下游写不出去。若不优先取心跳错误，ErrWriteTimeout 会被上游的
+// 读错误遮蔽，生产上就丢掉了"这条连接写不动"这个关键信号。
+func finalErr(cause error, hbErr <-chan error) error {
+    select {
+    case hbFail := <-hbErr:
+        if errors.Is(hbFail, ssex.ErrClientGone) || errors.Is(hbFail, context.Canceled) {
+            return nil // 下游已断开，正常收尾
+        }
+
+        return hbFail
+    default:
+    }
+
+    return cause
+}
 ```
 
 要点：
@@ -669,6 +699,7 @@ closeStream(stream, gin.H{"reason": "done"}) // 终止帧失败要能发现，�
 - **区分"收到结束哨兵"与"只是读到 EOF"**：后者意味着内容被截断（上游异常关闭、代理提前结束响应都会走到这里），必须用不同的终止原因告诉前端，否则半截回答会被当成完整答案
 - `defer resp.Body.Close()` 一定要有
 - token 流在 handler 内直接写出，**不经 Hub**：Hub 的队列会在满时丢弃事件，而 token 少一条就损坏文本
+- **校验通过后显式 `Start()`**：否则响应头要等第一个 token 或第一次心跳才提交
 - **长空闲期要有心跳**：模型思考、工具调用期间下游没有字节，链路上任何一层的空闲超时都会掐断连接。只有当上游能保证最大空闲间隔小于链路最短 idle timeout 时才可以省掉心跳
 - **上游客户端按阶段设超时**：`http.Client.Timeout` 覆盖整个响应体读取，会掐断正常长流；改用 `DialContext` / `TLSHandshakeTimeout` / `ResponseHeaderTimeout`，最长生成时长用 `context.WithTimeout` 控制
 - 结束时用 `Close` 终止流，前端 `es.close()`，避免自动重连
