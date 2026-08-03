@@ -12,11 +12,40 @@ LINT_TARGETS ?= ./...
 # COVERAGE_MIN       覆盖率下限（百分比整数），0 表示不检查
 # REQUIRE_CHANGELOG  1 表示 CHANGELOG.md 必须有对应版本条目，否则拒绝发版
 # EXTRA_TEST_TARGET  发版前额外执行的 make 目标名（如集成测试），留空则跳过
+# REQUIRED_CHECKS    push-tag 要求必须存在且成功的 check run 名（对应 ci.yml 的 job 名）
 BUMP              ?= patch
 RELEASE_REMOTE    ?= gtkit
 COVERAGE_MIN      ?= 80
 REQUIRE_CHANGELOG ?= 1
 EXTRA_TEST_TARGET ?= test-gincompat
+REQUIRED_CHECKS   ?= test gincompat
+
+# push-tag 的 CI 判定。只认 github-actions 来源的 check run，并且要求：
+# REQUIRED_CHECKS 里的每个名字都出现过（漏掉一个就说明那个 job 还没跑或没建），
+# 且我们自己的 check run 全部 completed + success。少了任何一条都拒绝发布。
+define CI_CHECK_PY
+import json, os, sys
+
+required = set(os.environ["REQUIRED_CHECKS"].split())
+runs = json.load(sys.stdin).get("check_runs") or []
+ours = [r for r in runs if ((r.get("app") or {}).get("slug")) == "github-actions"]
+for r in runs:
+    tag = "" if r in ours else "  (非 Actions 来源，不计入)"
+    print("   {} | {} | {}{}".format(r["name"], r["status"], r["conclusion"], tag))
+
+missing = sorted(required - {r["name"] for r in ours})
+if missing:
+    print("   ✗ 缺少预期检查: " + ", ".join(missing))
+    sys.exit(1)
+
+bad = sorted({r["name"] for r in ours if not (r["status"] == "completed" and r["conclusion"] == "success")})
+if bad:
+    print("   ✗ 未通过: " + ", ".join(bad))
+    sys.exit(1)
+
+print("   ✓ 预期检查全部存在且成功")
+endef
+export CI_CHECK_PY
 
 
 tool: ## 只读静态检查（不修改代码，格式化用 make fmt）
@@ -100,7 +129,8 @@ tag:
 	git push $(RELEASE_REMOTE) HEAD; \
 	printf "\n已推送 main，并在本地打好附注标签 %s。\n" "$$new"; \
 	printf "标签**尚未**发布到远端：Go module proxy 一旦抓取标签就永久不可变,\n"; \
-	printf "删除或覆盖都无法收回,因此先确认远端 CI 通过,再执行:\n\n    make push-tag\n\n"
+	printf "删除或覆盖都无法收回,因此等远端 CI 跑完再执行:\n\n    make push-tag\n\n"; \
+	printf "push-tag 会自己核对这个 commit 的 CI 结论,未全绿会拒绝推送。\n\n"
 
 push-tag: ## 发布第二步：远端 CI 通过后，把 HEAD 上的标签推送到远端
 	@set -e; \
@@ -113,6 +143,29 @@ push-tag: ## 发布第二步：远端 CI 通过后，把 HEAD 上的标签推送
 	fi; \
 	if git ls-remote --exit-code --tags $(RELEASE_REMOTE) "refs/tags/$$tag" >/dev/null 2>&1; then \
 		printf "✓ %s 已在远端，无需重复推送\n" "$$tag"; exit 0; \
+	fi; \
+	if [ "$(SKIP_CI_CHECK)" != "1" ]; then \
+		for bin in curl python3; do \
+			command -v $$bin >/dev/null 2>&1 || { \
+				echo "✗ 缺少 $${bin}，无法核对远端 CI 状态（本检查依赖 curl 与 python3）"; \
+				echo "  装上后重试，或在已确认 CI 全绿时用 make push-tag SKIP_CI_CHECK=1 跳过"; exit 1; }; \
+		done; \
+		sha=$$(git rev-parse HEAD); \
+		repo=$$(git remote get-url $(RELEASE_REMOTE) | sed -e 's|^git@github.com:||' -e 's|^https://github.com/||' -e 's|\.git$$||'); \
+		printf "▶️ 核对 %s@%s 的 CI 结论（要求：%s）\n" "$$repo" "$$sha" "$(REQUIRED_CHECKS)"; \
+		tok="$${GITHUB_TOKEN:-$$GH_TOKEN}"; \
+		if [ -n "$$tok" ]; then auth="Authorization: Bearer $$tok"; else auth="X-No-Auth: 1"; fi; \
+		body=$$(curl -fsSL -H "Accept: application/vnd.github+json" -H "$$auth" \
+			"https://api.github.com/repos/$$repo/commits/$$sha/check-runs" 2>/dev/null || true); \
+		if [ -z "$$body" ]; then \
+			echo "✗ 查不到 CI 状态。可能原因：该 commit 未推送、网络不可达、仓库私有，"; \
+			echo "  或未认证请求撞到 GitHub 的 60 次/小时限额（设 GITHUB_TOKEN 可提高限额）"; \
+			echo "  已确认远端 CI 全绿时，可用 make push-tag SKIP_CI_CHECK=1 跳过本检查"; exit 1; \
+		fi; \
+		if ! printf '%s' "$$body" | REQUIRED_CHECKS="$(REQUIRED_CHECKS)" python3 -c "$$CI_CHECK_PY"; then \
+			echo "✗ 拒绝发布标签：预期检查未全部存在并成功（或 API 响应无法解析）"; \
+			echo "  已推送的标签会被 Go module proxy 永久缓存，不能等 CI 结果出来再补救"; exit 1; \
+		fi; \
 	fi; \
 	echo "▶️ 推送 $$tag 到 $(RELEASE_REMOTE)"; \
 	git push $(RELEASE_REMOTE) "$$tag"; \

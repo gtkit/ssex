@@ -30,8 +30,10 @@ jobs:
 
       # 固定版本：latest 会随上游发布而变，构建结果不可复现。
       # 与本地开发所用版本保持一致。
+      # 必须用 action v7+：v6 对 golangci-lint 版本设了上限，传 v2.x 会直接失败
+      # （v7.0.0 发布说明原文："The GitHub Action v7 supports golangci-lint v2 only"）
       - name: Lint
-        uses: golangci/golangci-lint-action@55c2c1448f86e01eaae002a5a3a9624417608d84 # v6
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.11.4
 
@@ -80,7 +82,7 @@ jobs:
         run: go vet ./...
 
       - name: Lint
-        uses: golangci/golangci-lint-action@55c2c1448f86e01eaae002a5a3a9624417608d84 # v6
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.11.4
           working-directory: gincompat

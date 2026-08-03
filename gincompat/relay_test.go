@@ -202,6 +202,58 @@ func newRelayServer(t *testing.T, deps relayDeps) *httptest.Server {
 	return httptest.NewServer(engine)
 }
 
+// testBound 是本文件所有等待的兜底上界。正常路径远远用不到它——它的作用是让回归
+// 表现为一条指名道姓的失败，而不是挂到包级 timeout 才被发现。
+const testBound = 10 * time.Second
+
+// postStream 发起转发请求。请求绑定带上界的 ctx，因此后续读响应体在回归时不会无限
+// 阻塞；响应体与 ctx 都交给 t.Cleanup 收尾（LIFO：先关 body 再 cancel）。
+func postStream(t *testing.T, url string) *http.Response {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testBound)
+	t.Cleanup(cancel)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s 失败: %v", url, err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	return resp
+}
+
+// awaitResult 有界等待 handler 的返回值。
+func awaitResult(t *testing.T, results <-chan error) error {
+	t.Helper()
+
+	select {
+	case err := <-results:
+		return err
+	case <-time.After(testBound):
+		t.Fatalf("handler 未在 %s 内返回", testBound)
+
+		return nil
+	}
+}
+
+// awaitSignal 有界等待一个信号。
+func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+	case <-time.After(testBound):
+		t.Fatalf("%s 未在 %s 内发生", what, testBound)
+	}
+}
+
 func TestRelayForwardsUntilDoneSentinel(t *testing.T) {
 	t.Parallel()
 
@@ -219,11 +271,7 @@ func TestRelayForwardsUntilDoneSentinel(t *testing.T) {
 	})
 	defer relay.Close()
 
-	resp, err := http.Post(relay.URL+"/chat", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatalf("POST failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
+	resp := postStream(t, relay.URL+"/chat")
 
 	var got []string
 	for msg, decErr := range ssex.Decode(resp.Body) {
@@ -236,7 +284,7 @@ func TestRelayForwardsUntilDoneSentinel(t *testing.T) {
 		}
 	}
 
-	if handlerErr := <-results; handlerErr != nil {
+	if handlerErr := awaitResult(t, results); handlerErr != nil {
 		t.Fatalf("handler error = %v, want nil", handlerErr)
 	}
 	// 两个增量 + 终止帧；[DONE] 本身不转发
@@ -267,11 +315,7 @@ func TestRelayReportsTruncationWithoutSentinel(t *testing.T) {
 	})
 	defer relay.Close()
 
-	resp, err := http.Post(relay.URL+"/chat", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatalf("POST failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
+	resp := postStream(t, relay.URL+"/chat")
 
 	var last string
 	for msg, decErr := range ssex.Decode(resp.Body) {
@@ -288,7 +332,7 @@ func TestRelayReportsTruncationWithoutSentinel(t *testing.T) {
 		t.Fatalf("终止帧 = %q, want reason=incomplete（缺结束哨兵必须可区分）", last)
 	}
 
-	handlerErr := <-results
+	handlerErr := awaitResult(t, results)
 	if handlerErr == nil {
 		t.Fatal("handler error = nil，缺结束哨兵时必须返回错误以便告警")
 	}
@@ -327,13 +371,9 @@ func TestRelayRejectsBadUpstream(t *testing.T) {
 			})
 			defer relay.Close()
 
-			resp, err := http.Post(relay.URL+"/chat", "application/json", strings.NewReader(`{}`))
-			if err != nil {
-				t.Fatalf("POST failed: %v", err)
-			}
-			defer func() { _ = resp.Body.Close() }()
+			resp := postStream(t, relay.URL+"/chat")
 
-			handlerErr := <-results
+			handlerErr := awaitResult(t, results)
 			if handlerErr == nil {
 				t.Fatal("handler error = nil, want upstream rejection")
 			}
@@ -365,31 +405,39 @@ func TestRelayAcceptsCaseInsensitiveContentType(t *testing.T) {
 	})
 	defer relay.Close()
 
-	resp, err := http.Post(relay.URL+"/chat", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatalf("POST failed: %v", err)
+	resp := postStream(t, relay.URL+"/chat")
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+		t.Fatalf("content type = %q，合法的大小写变体应当被接受并起流", got)
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	if handlerErr := <-results; handlerErr != nil {
+	if handlerErr := awaitResult(t, results); handlerErr != nil {
 		t.Fatalf("handler error = %v, want nil（大小写变体是合法的）", handlerErr)
 	}
 }
 
 // TestRelayStartsStreamBeforeFirstToken 验证校验通过后立即起流：
 // 响应头不该等到第一个 token 才提交。
+//
+// 这里不做墙钟断言。上游在测试放行之前一个 token 都不发，而 http.Client.Do 是在
+// 收到响应头时才返回——所以"能拿到 SSE 响应头"本身就证明起流不依赖首 token。
+// 没有时间阈值，也就没有机器抖动导致的假失败；起流真的丢了，则表现为 postStream
+// 卡到 testBound 后报错。
 func TestRelayStartsStreamBeforeFirstToken(t *testing.T) {
 	t.Parallel()
 
-	const firstTokenDelay = 400 * time.Millisecond
-
+	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		time.Sleep(firstTokenDelay) // 模型思考
+		select { // 模型思考：放行前不吐任何 token
+		case <-release:
+		case <-r.Context().Done():
+
+			return
+		}
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer upstream.Close()
@@ -397,19 +445,12 @@ func TestRelayStartsStreamBeforeFirstToken(t *testing.T) {
 	relay := newRelayServer(t, relayDeps{upstreamURL: upstream.URL})
 	defer relay.Close()
 
-	begin := time.Now()
-	resp, err := http.Post(relay.URL+"/chat", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatalf("POST failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if elapsed := time.Since(begin); elapsed >= firstTokenDelay {
-		t.Fatalf("响应头耗时 %s，说明没有显式起流（首 token 延迟 %s）", elapsed, firstTokenDelay)
-	}
+	resp := postStream(t, relay.URL+"/chat")
 	if got := resp.Header.Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
-		t.Fatalf("content type = %q", got)
+		t.Fatalf("content type = %q，响应头不是由 Start() 提交的", got)
 	}
+
+	close(release)
 }
 
 // TestRelayHeartbeatKeepsConnectionAlive 验证首 token 迟迟不来时心跳仍在发注释帧——
@@ -442,17 +483,14 @@ func TestRelayHeartbeatKeepsConnectionAlive(t *testing.T) {
 	})
 	defer relay.Close()
 
-	resp, err := http.Post(relay.URL+"/chat", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatalf("POST failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
+	resp := postStream(t, relay.URL+"/chat")
 
-	// 首 token 之前应当只读到注释帧
+	// 首 token 之前应当只读到注释帧。读被 postStream 的 ctx 兜底：心跳没了就读不到
+	// 任何字节，会在 testBound 到时失败，而不是挂到包级 timeout。
 	buf := make([]byte, 256)
 	n, err := resp.Body.Read(buf)
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("读响应体失败（心跳未发出注释帧？）: %v", err)
 	}
 	got := string(buf[:n])
 	if !strings.HasPrefix(got, ":") {
@@ -498,19 +536,12 @@ func TestRelayCancelsUpstreamWhenClientGone(t *testing.T) {
 	relay := newRelayServer(t, relayDeps{upstreamURL: upstream.URL})
 	defer relay.Close()
 
-	resp, err := http.Post(relay.URL+"/chat", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatalf("POST failed: %v", err)
-	}
+	resp := postStream(t, relay.URL+"/chat")
 	// 读到首帧确认转发已开始，然后断开
 	if _, err := resp.Body.Read(make([]byte, 32)); err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("读首帧失败: %v", err)
 	}
 	_ = resp.Body.Close()
 
-	select {
-	case <-upstreamDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("下游断开后上游请求未被取消：会继续为已离开的用户烧 token")
-	}
+	awaitSignal(t, upstreamDone, "下游断开后取消上游请求（否则会继续为已离开的用户烧 token）")
 }

@@ -134,6 +134,8 @@ func StreamDemo(w http.ResponseWriter, r *http.Request) {
 
 创建一个业务层友好的 SSE 输出器。`w` 与 `r` 都必须非 nil——传 nil 是编程错误，库不做防御性降级，因为一个写不出字节的 `Stream` 比直接 panic 难定位得多。同理 `Decode(r)` 的 `r`、`LastEventID(r)` 的 `r`、`Heartbeat(ctx, …)` 的 `ctx` 都必须非 nil。
 
+这是本库唯一一处会 panic 的路径，且是**经过评估后有意保留**的：拿到 error 的调用方对"没有 `ResponseWriter`"无事可做，唯一正确处理就是改代码，而这个错误在任何一次请求里都会立刻暴露；让全部正确调用方多写一次判断换不到任何东西。取值合法性问题（字段含换行、`retry` 越界等）一律返回 `error`，不 panic。该行为由 `TestNilArgumentsPanic` 固定，PATCH 版本不会改动它。
+
 ```go
 stream := ssex.NewStream(c.Writer, c.Request)
 ```
@@ -915,6 +917,35 @@ Hub 只维护注册表，不做全局连接数上限、单 key 连接上限或 I
 - 唯一直接依赖：`github.com/gtkit/json/v2`；`go mod graph` 里的其余条目均为它的传递依赖
 - 入口只用标准库 HTTP 接口，因此 net/http、gin、chi 共用同一套实现
 - 版本按 [SemVer](https://semver.org/lang/zh-CN/) 走，破坏性变更在 [CHANGELOG.md](./CHANGELOG.md) 以 ⚠ 标注并附迁移写法
+
+### 8.1 默认构建实际链入什么
+
+`go.mod` 里有十几条 `// indirect`，但**默认构建一条都不会编进你的二进制**：
+
+```console
+$ go list -deps github.com/gtkit/ssex | grep -E '^[^/]+\.[^/]+/'
+github.com/gtkit/json/v2
+github.com/gtkit/ssex
+
+$ go list -f '{{join .Imports "\n"}}' github.com/gtkit/json/v2
+bytes
+encoding/json
+io
+unsafe
+```
+
+原因是 `gtkit/json/v2` 是 build tag 门控的 JSON 门面：默认那份实现走 `encoding/json`，sonic / json-iterator / goccy 三个引擎各自被 build tag 挡在门外，那些 `// indirect` 条目只为让 tag 可用而存在。
+
+所以：
+
+- **默认构建的 JSON 行为等同于 `encoding/json`**：默认那份实现把 `API` 设为委托 `encoding/json` 的后端
+- 需要更快的编解码时，下游用 `-tags sonic`（或 `jsoniter` / `go_json`）换引擎，不必改一行代码——SSE 高频转发 JSON 正是这类场景
+
+代价是三项，都不为零：
+
+- **体积多约 5 KB**。最小可执行程序实测（darwin/amd64、Go 1.26）：直接用 `encoding/json` 为 2,956,128 字节，改用 `gtkit/json/v2` 为 2,961,072 字节，多 4,944 字节（+0.17%）。多出来的是门面代码与两个 `init`
+- **每次调用多一层接口分派**：`Marshal` 走的是 `var API Core` 这个接口变量，不是直接函数委托
+- **模块图会传播**：那些 `// indirect` 条目经 MVS 进入下游的构建列表，可能顶高下游同名模块的版本
 
 ## 9. Gin 集成
 
