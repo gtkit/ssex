@@ -477,14 +477,15 @@ func Subscribe(c *gin.Context) {
 | `WithQueueSize(n)` | 每连接队列容量，默认 32，非正值忽略 |
 | 返回值 | `Push` / `Broadcast` 返回 `(delivered, dropped)`：`dropped` 是被挤掉的**旧**事件数 |
 
-六条使用约束：
+七条使用约束：
 
 1. **先 `Start()` 再进消费循环**：纯推送型 handler 在第一条事件到来前不写字节，起流才能让前端及时拿到响应头并触发 `onopen`；`Start()` 返回错误说明连接已不可用，直接返回。
 2. **投递与写出分离**：`Push` 只把事件放进队列，写出由持有连接的 handler 完成，因此写动作始终发生在 handler 自己的 goroutine、`ResponseWriter` 仍有效的窗口内。
 3. **队列满时保留最新（latest-wins）**：挤掉队首最旧的一条，让最新事件一定入队，`dropped` 是被挤掉的旧事件数。状态推送里最新一条描述的就是当前状态，必须送达。
 4. **顺序只在单连接内保证**：多个 goroutine 并发 `Push` / `Broadcast` 时，它们之间的相对顺序由调度决定，不同连接可能观察到不同顺序。状态事件应携带**单调递增的 revision**（放进 `Event.ID` 或载荷），消费端按 revision 取大者、忽略更旧的值。
 5. **载荷投递后不可再改**：同一份 `Event.Data` 会被该 key 下的多个连接各自序列化，且发生在它们各自的 goroutine 里；投递后再修改其中的 map、切片或指针内容会构成数据竞争。需要复用结构体就投递前拷贝一份。
-6. **适用边界与容量**：Hub 面向**状态推送**——每条事件自带完整状态，丢掉中间过程无妨；状态查询类场景建议 `WithQueueSize(1)`，容量大于 1 只会积压已经过时的中间状态。AI token 流每一条都是文本的一部分，少一条就损坏输出，应在 handler 内直接用 `stream.Data` 写出，不经 Hub。
+6. **容量与顺序的组合风险**：latest-wins 按**到达顺序**保留最后一条，不比较业务 revision。多个并发推送方存在时，到达顺序可能与 revision 顺序相反——容量为 1 时后到的旧版本会挤掉先到的新版本，消费端再也看不到它，`lastRev` 过滤也救不回来。因此 `WithQueueSize(1)` 只在**同一 key 的推送已串行化**时才安全；否则至少满足一条：同一 key 经单点串行化后再 `Push`／容量留大于 1 并由消费端按 revision 过滤／终态后回读一次事实源做校准。
+7. **适用边界**：Hub 面向**状态推送**——每条事件自带完整状态，丢掉中间过程无妨。AI token 流每一条都是文本的一部分，少一条就损坏输出，应在 handler 内直接用 `stream.Data` 写出，不经 Hub。
 
 消费循环用 `stream.Context().Done()` 退出，队列由 GC 回收。
 
@@ -801,7 +802,10 @@ func OrderEvents(c *gin.Context) {
         <-hbDone
     }()
 
-    // 7. 事件循环：四个退出口。
+    // 7. 事件循环：四个退出口。lastRev 从快照起步并随成功发送推进——
+    //    只比快照不够：Hub 不保证跨推送方的到达顺序，快照之后仍可能先到 rev 10、
+    //    后到 rev 9，只比快照会把 9 也转发出去，前端状态回退。
+    lastRev := snapRev
     for {
         select {
         case <-appShutdown.Done(): // 应用停机（见 6.9）
@@ -816,15 +820,22 @@ func OrderEvents(c *gin.Context) {
             return
 
         case e := <-events:
-            // 跳过不比快照新的事件：订阅到读快照之间积压的那些，快照里已经含了，
-            // 直接转发会让前端出现状态回退。
-            if revisionOf(e) <= snapRev {
+            rev, ok := revisionOf(e)
+            if !ok {
+                // 生产者没填 revision：告警而不是静默丢弃。若把解析失败当成 0，
+                // 事件会因为 0 <= lastRev 被默默吃掉，排查时只看到"前端收不到状态"。
+                logger.Warn("事件缺少 revision", zap.Any("event", e))
                 continue
+            }
+            if rev <= lastRev {
+                continue // 积压的旧事件，或乱序到达的回退版本
             }
             if err := stream.Send(e); err != nil {
                 handleStreamError(c, stream, err)
                 return
             }
+            lastRev = rev
+
             if isTerminal(e) { // 终态：主动结束，避免前端自动重连（见 6.4）
                 _ = stream.Close(gin.H{"reason": "final"})
                 return
@@ -888,6 +899,20 @@ SSE 路由要避开这几类中间件：
 | 把所有错误转成 JSON | 流已开始后再写 JSON 同样损坏响应 |
 
 鉴权、Recovery、Tracing 可以正常使用，但**鉴权必须在 `Start()` 之前完成**——起流之后就没法再回 401 了。
+
+**替换 `c.Writer` 的自定义中间件必须实现 `Unwrap() http.ResponseWriter` 并正确透传 `Flush`。** 否则 `http.ResponseController` 沿不到底层连接，`SetWriteDeadline` 返回 `http.ErrNotSupported`，本库按约定静默降级——后果是逐帧写超时失效，且**解除 `http.Server.WriteTimeout` 的能力一并失效**，长连接仍会在全局超时到期时被掐断。这个降级不会报错，所以上线前要核对真实的中间件链，而不只是裸 gin。
+
+```go
+type myWriter struct {
+    gin.ResponseWriter
+    // ...自己的字段
+}
+
+// 必须有：否则 SetWriteDeadline 与 WriteTimeout 清除都会降级
+func (w *myWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+```
+
+自查办法：在真实中间件链下跑一个把 `http.Server.WriteTimeout` 设成几百毫秒的用例，持续写若干秒并断言最后一帧仍能收到——`gincompat` 里的 `TestSurvivesServerWriteTimeout` 就是这个形状，把它挪到你自己的路由与中间件上即可。
 
 用独立路由组隔离：
 

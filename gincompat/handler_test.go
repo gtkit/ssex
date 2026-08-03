@@ -30,18 +30,23 @@ type orderEventsDeps struct {
 	load func(ctx context.Context, orderID string) (int64, gin.H, error)
 	// onStreamError 记录 handler 观察到的错误，供断言。
 	onStreamError func(started bool, err error)
+	// onInvalidRevision 在事件缺少有效 revision 时被调用（生产上应告警）。
+	onInvalidRevision func(ssex.Event)
 	// terminal 判断某条事件是否终态。
 	terminal func(ssex.Event) bool
 }
 
 // revisionOf 取事件携带的 revision（模板约定放在 Event.ID 里）。
-func revisionOf(e ssex.Event) int64 {
+//
+// 第二个返回值区分"没有有效 revision"与"revision 恰好是 0"：解析失败时不能
+// 默默当成 0，那会让生产者忘填 Event.ID 的事件被静默丢弃、且没有任何信号。
+func revisionOf(e ssex.Event) (int64, bool) {
 	rev, err := strconv.ParseInt(e.ID, 10, 64)
 	if err != nil {
-		return 0
+		return 0, false
 	}
 
-	return rev
+	return rev, true
 }
 
 // orderEvents 是 README 9.2 的模板 handler。
@@ -109,7 +114,10 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 			<-hbDone
 		}()
 
-		// 7. 四个退出口
+		// 7. 事件循环：四个退出口。lastRev 从快照起步并随成功发送推进——
+		//    只比快照不够：Hub 不保证跨推送方的到达顺序，快照之后仍可能先到
+		//    revision 10、后到 revision 9，只比快照会把 9 也转发出去，前端状态回退。
+		lastRev := snapRev
 		for {
 			select {
 			case <-deps.appShutdown.Done():
@@ -126,15 +134,26 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 				return
 
 			case e := <-events:
-				// 跳过不比快照新的事件：订阅到读快照之间积压的那些，快照里已经含了
-				if revisionOf(e) <= snapRev {
+				rev, ok := revisionOf(e)
+				if !ok {
+					// 生产者没填 revision：告警而不是静默丢弃，
+					// 是跳过还是结束连接由业务定，这里选择跳过。
+					if deps.onInvalidRevision != nil {
+						deps.onInvalidRevision(e)
+					}
+
 					continue
+				}
+				if rev <= lastRev {
+					continue // 积压的旧事件，或乱序到达的回退版本
 				}
 				if err := stream.Send(e); err != nil {
 					handleStreamError(c, stream, deps, err)
 
 					return
 				}
+				lastRev = rev
+
 				if deps.terminal != nil && deps.terminal(e) {
 					_ = stream.Close(gin.H{"reason": "final"})
 

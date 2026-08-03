@@ -97,15 +97,26 @@ func (s *Stream) Retry(milliseconds int) error {
 // （见 Stream 的生命周期说明）。用独立 ctx 加等待，而不是只发个停止信号：
 //
 //	hbCtx, stop := context.WithCancel(c.Request.Context())
-//	hbErr := make(chan error, 1)
-//	go func() { hbErr <- stream.Heartbeat(hbCtx, 15*time.Second) }()
+//	hbErr := make(chan error, 1)   // 传错误
+//	hbDone := make(chan struct{})  // 表示"已退出"
+//	go func() {
+//	    defer close(hbDone)
+//	    if err := stream.Heartbeat(hbCtx, 15*time.Second); err != nil {
+//	        hbErr <- err
+//	    }
+//	}()
 //	defer func() {
 //	    stop()
-//	    <-hbErr // 等它真的退出，再让 handler 返回
+//	    <-hbDone // 等它真的退出，再让 handler 返回
 //	}()
 //
 // 独立 ctx 的作用是：handler 因终态、写失败或应用停机而返回时（此时请求上下文
 // 可能还没取消）也能停掉心跳。把 hbErr 接进主 select 就能同时感知心跳写失败。
+//
+// 错误信号与退出信号必须是两个 channel。用同一个兼任时，主循环的 case 消费掉
+// 唯一那次发送后，defer 里的第二次接收就永远等不到发送者——handler 永久阻塞，
+// 连按 LIFO 排在后面的注销逻辑（如 Hub 的 release）都不会执行。
+// hbDone 用 close，读多少次都立即返回。
 //
 // 长时间无数据的流（等支付结果、等登录态）必须有心跳，否则代理层会按空闲连接断开。
 // ctx 取消时返回 ctx 错误；客户端断开返回 ErrClientGone；流已终止返回 ErrStreamClosed。

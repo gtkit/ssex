@@ -6,8 +6,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 `gincompat/` 独立测试模块（自带 go.mod，主模块依赖清单因此仍不含任何 web 框架）：把 gin 集成做成可持续运行的回归测试，覆盖鉴权在起流前拒绝、快照+带外推送+终态 `Close`、心跳 goroutine 在 handler 返回前收尾、长连接不被 `http.Server.WriteTimeout` 截断、客户端断开判定、`Started()` 错误分界、应用停机收尾、与 Recovery / Logger 中间件共存。
+- README 新增「Gin 集成」一节：完整 handler 模板（鉴权 → 起流错误 → 先订阅后快照 → 心跳收尾 → 四出口事件循环）、以 `Started()` 分界的错误处理规范与错误分级、中间件兼容清单与路由组隔离、`c.Writer` 生命周期约束。
+
 ### Fixed
 
+- ⚠ 修复 `Stream.Heartbeat` 的 GoDoc 示例仍是会死锁的旧范式：README 与 gin 模板已修正，但公共 API 的 GoDoc 漏改，而它会直接出现在 IDE 与 pkg.go.dev，比 README 更容易被原样复制。
+- ⚠ 修复文档模板的 revision 过滤只与快照比较：`revision <= snapRev` 能挡住订阅到读快照之间积压的旧事件，但挡不住快照之后乱序到达的回退版本（Hub 不保证跨并发推送方的到达顺序，先到 rev 10、后到 rev 9 时 9 也会被转发，前端状态回退）。模板改为维护随成功发送推进的 `lastRev`。
+- 修复模板把 revision 解析失败当作 0 的静默丢弃：生产者忘填 `Event.ID` 时事件会因 `0 <= lastRev` 被默默吃掉且没有任何信号。`revisionOf` 改为返回是否有效，模板在无效时上报告警并跳过。
 - ⚠ 修复文档模板会让 handler 永久阻塞的缺陷：心跳模板原先用同一个 channel 既传错误、又当"goroutine 已退出"信号。心跳 goroutine 只发送一次结果，主循环消费掉之后，`defer` 里的第二次接收永远等不到发送者。后果不止泄漏一个 goroutine——`defer release()` 按 LIFO 排在阻塞的 defer 之后，因此 Hub 注册表不清理、`Online` 长期不准、`http.Server.Shutdown` 一直等、gin `Context` 无法归还对象池。现改为错误走 `hbErr`、退出走 `close(hbDone)`，两个信号分离。已由确定性复现测试守住（修复前卡到超时，修复后 0.04s 通过）。
 - ⚠ 修复文档模板的订阅顺序：README 9.2 原先是 `Load → Start → Subscribe`，与 6.7 自述的"先订阅、后取快照"矛盾。`Load` 与 `Subscribe` 之间发生的状态变更此时无人订阅、推送被直接丢弃，客户端拿到旧快照后再也收不到更新——正好命中订单支付与登录态场景。现改为 `Subscribe → 读快照 → Start → 发快照`，并在消费循环中跳过 revision 不大于快照的积压事件。新增两个测试覆盖"读快照期间发生变更"与"积压旧事件被过滤"。
 - 修复 README 4.12 仍保留的不安全心跳示例（丢弃错误、不等待 goroutine 退出）。
@@ -17,14 +25,6 @@
 - 起流的响应头刷新纳入 per-write 写截止时间（`WithWriteTimeout`）。此前 `WriteHeaders` 先清除 `http.Server.WriteTimeout`、随后直接刷新，而逐帧截止时间只作用于后续帧，异常或恶意连接可以让 handler 无上界地卡在起流上。
 - 解除 `http.Server.WriteTimeout` 失败时不再静默继续：除 `http.ErrNotSupported`（底层不支持，降级）外一律返回错误，且此时响应头尚未提交、`Started()` 保持 false，调用方仍可改回普通 JSON。吞掉这个错误等于谎称长连接已保活，而连接其实仍会在全局写超时到期时被服务端中断。
 - `Option` 与 `HubOption` 跳过 nil，不再因调用方传入零值 Option 而 panic。
-
-### Added
-
-- 新增 `gincompat/` 独立测试模块（自带 go.mod，主模块依赖清单因此仍不含任何 web 框架）：把 gin 集成做成可持续运行的回归测试，覆盖鉴权在起流前拒绝、快照+带外推送+终态 `Close`、心跳 goroutine 在 handler 返回前收尾、长连接不被 `http.Server.WriteTimeout` 截断、客户端断开判定、`Started()` 错误分界、应用停机收尾、与 Recovery / Logger 中间件共存。
-- README 新增「Gin 集成」一节：完整 handler 模板（鉴权 → 起流错误 → 先订阅后快照 → 心跳收尾 → 四出口事件循环）、以 `Started()` 分界的错误处理规范与错误分级、中间件兼容清单与路由组隔离、`c.Writer` 生命周期约束。
-
-### Fixed
-
 - 修正 README 的心跳模板：原写法只发停止信号、不等 goroutine 退出。gin 的 `c.Writer` 是 `Context` 的内部字段，handler 返回后 `Context` 归还对象池并在下个请求中被重置，因此心跳 goroutine 若在 handler 返回后仍在写入，就会写到另一个请求的响应上。模板改为独立 ctx + `defer stop(); <-hbDone` 等待退出。
 
 ### Changed
@@ -35,6 +35,8 @@
 - `ErrInvalidArgument` 的文档措辞修正：只有首帧构造失败时响应头尚未提交，流已开始之后出现该错误仅表示这一帧被拒绝。
 - README 的 Hub handler 模板改为处理 `Start()` 错误、把心跳错误接进主 `select`，并新增应用级停机分支；新增大模型转发的上游约束（绑定下游 context、校验状态码与 `Content-Type`、始终关闭响应体、下游写失败即取消上游、token 不经 Hub）、优雅停机与运维边界（容量/限流归应用、建议监控的信号）两节。
 - CI 的 action 固定到 commit SHA，避免版本 tag 被移动导致构建不可复现。
+- `Hub` 的容量建议补上前提：latest-wins 按**到达顺序**保留最后一条、不比较业务 revision，因此 `WithQueueSize(1)` 只在同一 key 的推送已串行化时才安全；否则后到的旧版本会挤掉先到的新版本，消费端按 revision 过滤也救不回来。文档给出三条缓解方式。
+- README 9.4 补充中间件约束：替换 `c.Writer` 的自定义中间件必须实现 `Unwrap() http.ResponseWriter` 并透传 `Flush`，否则 `SetWriteDeadline` 与"解除 `http.Server.WriteTimeout`"都会静默降级，长连接仍会被全局超时掐断；并给出自查办法。
 
 ## [v0.2.0] - 2026-07-31
 
