@@ -15,6 +15,12 @@ import (
 //
 // 并发安全:Stream 用互斥锁串行化所有写方法,可从不同 goroutine
 // (如心跳 goroutine + 业务 goroutine)并发调用。
+//
+// 生命周期:底层 http.ResponseWriter 只在 handler 执行期间有效,框架可能池化
+// 复用它——gin 的 c.Writer 就是 Context 的内部字段,handler 返回后归还对象池,
+// 下个请求会把它重置到另一个响应上。因此在 handler goroutine 之外写入的
+// goroutine 必须在 handler 返回前退出,否则会写到别人的响应上。
+// 心跳这类后台写入的正确收尾写法见 Heartbeat。
 type Stream struct {
 	writer  *Writer
 	mu      sync.Mutex
@@ -86,9 +92,20 @@ func (s *Stream) Retry(milliseconds int) error {
 
 // Heartbeat 每隔 interval 发送一条保活注释帧，直到 ctx 取消或写入失败。
 //
-// 阻塞运行，启动时机与所在 goroutine 由调用方控制：
+// 阻塞运行，启动时机与所在 goroutine 由调用方控制。它在 handler 之外的 goroutine
+// 里写入，因此必须在 handler 返回前退出——底层 ResponseWriter 会被框架池化复用
+// （见 Stream 的生命周期说明）。用独立 ctx 加等待，而不是只发个停止信号：
 //
-//	go func() { _ = stream.Heartbeat(c.Request.Context(), 15*time.Second) }()
+//	hbCtx, stop := context.WithCancel(c.Request.Context())
+//	hbErr := make(chan error, 1)
+//	go func() { hbErr <- stream.Heartbeat(hbCtx, 15*time.Second) }()
+//	defer func() {
+//	    stop()
+//	    <-hbErr // 等它真的退出，再让 handler 返回
+//	}()
+//
+// 独立 ctx 的作用是：handler 因终态、写失败或应用停机而返回时（此时请求上下文
+// 可能还没取消）也能停掉心跳。把 hbErr 接进主 select 就能同时感知心跳写失败。
 //
 // 长时间无数据的流（等支付结果、等登录态）必须有心跳，否则代理层会按空闲连接断开。
 // ctx 取消时返回 ctx 错误；客户端断开返回 ErrClientGone；流已终止返回 ErrStreamClosed。

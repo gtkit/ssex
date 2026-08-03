@@ -45,3 +45,21 @@ jobs:
         run: |
           go test -fuzz=FuzzDecode -fuzztime=30s -run='^$' ./...
           go test -fuzz=FuzzRoundTrip -fuzztime=30s -run='^$' ./...
+
+  # gin 兼容性回归：独立模块，因此主模块的依赖清单里没有 gin
+  gincompat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        working-directory: gincompat
+        run: go vet ./...
+
+      - name: Test
+        working-directory: gincompat
+        run: go test -race -count=1 -timeout=5m ./...

@@ -12,8 +12,18 @@
 - 解除 `http.Server.WriteTimeout` 失败时不再静默继续：除 `http.ErrNotSupported`（底层不支持，降级）外一律返回错误，且此时响应头尚未提交、`Started()` 保持 false，调用方仍可改回普通 JSON。吞掉这个错误等于谎称长连接已保活，而连接其实仍会在全局写超时到期时被服务端中断。
 - `Option` 与 `HubOption` 跳过 nil，不再因调用方传入零值 Option 而 panic。
 
+### Added
+
+- 新增 `gincompat/` 独立测试模块（自带 go.mod，主模块依赖清单因此仍不含任何 web 框架）：把 gin 集成做成可持续运行的回归测试，覆盖鉴权在起流前拒绝、快照+带外推送+终态 `Close`、心跳 goroutine 在 handler 返回前收尾、长连接不被 `http.Server.WriteTimeout` 截断、客户端断开判定、`Started()` 错误分界、应用停机收尾、与 Recovery / Logger 中间件共存。
+- README 新增「Gin 集成」一节：完整 handler 模板（鉴权 → 起流错误 → 先订阅后快照 → 心跳收尾 → 四出口事件循环）、以 `Started()` 分界的错误处理规范与错误分级、中间件兼容清单与路由组隔离、`c.Writer` 生命周期约束。
+
+### Fixed
+
+- 修正 README 的心跳模板：原写法只发停止信号、不等 goroutine 退出。gin 的 `c.Writer` 是 `Context` 的内部字段，handler 返回后 `Context` 归还对象池并在下个请求中被重置，因此心跳 goroutine 若在 handler 返回后仍在写入，就会写到另一个请求的响应上。模板改为独立 ctx + `defer stop(); <-hbDone` 等待退出。
+
 ### Changed
 
+- `Stream` 与 `Stream.Heartbeat` 的 GoDoc 补写生命周期约束：底层 `http.ResponseWriter` 只在 handler 执行期间有效，在 handler goroutine 之外写入的 goroutine 必须在 handler 返回前退出；`c.Copy()` 的副本只能读请求元数据（gin 会把副本的 `ResponseWriter` 置为 nil），不能用于写响应。
 - `Event.Data` 补充所有权约束：投递给 `Hub.Push` / `Hub.Broadcast` 后即视为交出所有权，同一份载荷会被多个连接在各自 goroutine 里序列化，投递后修改其中的 map / 切片 / 指针会构成数据竞争。
 - `Hub` 补充顺序契约：事件顺序在单个连接内按入队顺序保证，跨并发推送方的相对顺序由调度决定；状态事件应携带单调递增的 revision，消费端按 revision 取大者。状态查询类场景建议 `WithQueueSize(1)`。
 - `ErrInvalidArgument` 的文档措辞修正：只有首帧构造失败时响应头尚未提交，流已开始之后出现该错误仅表示这一帧被拒绝。

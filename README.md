@@ -415,8 +415,17 @@ func Subscribe(c *gin.Context) {
 
     // 心跳错误要能被主循环看到：慢客户端会让心跳返回 ErrWriteTimeout，
     // 而此时请求上下文可能还没结束，只丢弃错误会让 handler 继续空等。
+    //
+    // 用独立 ctx 并在 defer 里等它退出：c.Writer 是 gin Context 的内部字段，
+    // handler 一返回就会被归还对象池、并在下个请求里指向另一个响应。
+    // 心跳 goroutine 必须在 handler 返回前结束，否则会写到别人的响应上。
+    hbCtx, stopHeartbeat := context.WithCancel(c.Request.Context())
     hbErr := make(chan error, 1)
-    go func() { hbErr <- stream.Heartbeat(stream.Context(), 15*time.Second) }()
+    go func() { hbErr <- stream.Heartbeat(hbCtx, 15*time.Second) }()
+    defer func() {
+        stopHeartbeat()
+        <-hbErr
+    }()
 
     for {
         select {
@@ -671,6 +680,8 @@ Hub 只维护注册表，不做全局连接数上限、单 key 连接上限或 I
 - [crossverify_test.go](./crossverify_test.go)
 - [reliability_test.go](./reliability_test.go)
 - [fuzz_test.go](./fuzz_test.go)
+- [startup_test.go](./startup_test.go)
+- [gincompat/](./gincompat)（独立模块：gin 集成回归）
 - [example_test.go](./example_test.go)
 
 覆盖点包括：
@@ -689,9 +700,169 @@ Hub 只维护注册表，不做全局连接数上限、单 key 连接上限或 I
 - 交叉验证：写侧输出交由解码器解回（含两处帧注入交给解析器判决）、规范章节的官方示例向量、真实连接上客户端断开触发 `ErrClientGone`、Hub 与 Stream 真实连接端到端、真实 HTTP/2 连接
 - 可靠性：Hub latest-wins（最新状态送达、连续溢出只留最后一条、容量窗口）、帧构造失败时不提交响应头、起流错误可观察、整帧与单行大小上限、`retry` 溢出、非法 UTF-8 原样保留
 - Fuzz：`FuzzDecode` 与 `FuzzRoundTrip`（随机 CR/LF、非法 UTF-8、超大多行帧、超大 retry、提前停止迭代）
+- 起流写路径：刷新受 per-write deadline 约束、解除连接级截止时间失败时不提交响应头、nil Option 被跳过
+- gin 集成（`gincompat` 独立模块）：鉴权在起流前拒绝、快照+推送+终态 `Close`、心跳 goroutine 在 handler 返回前收尾（`-race` 并发多轮）、长连接不被 `WriteTimeout` 截断、断开判定、`Started()` 分界、应用停机收尾
 
 ## 8. 依赖与版本
 
 - 唯一直接依赖：`github.com/gtkit/json/v2`；`go mod graph` 里的其余条目均为它的传递依赖
 - 入口只用标准库 HTTP 接口，因此 net/http、gin、chi 共用同一套实现
 - 版本按 [SemVer](https://semver.org/lang/zh-CN/) 走，破坏性变更在 [CHANGELOG.md](./CHANGELOG.md) 以 ⚠ 标注并附迁移写法
+
+## 9. Gin 集成
+
+库不依赖 gin，但 gin 是最常见的使用场景。这一节的三件事都是 gin 特有的坑。
+
+### 9.1 `c.Writer` 的生命周期等于 handler 的生命周期
+
+gin 的 `c.Writer` 是 `Context` 的内部字段（`c.Writer = &c.writermem`）。handler 返回后 `Context` 被归还对象池，下一个请求会把这个 writer 重置到**另一个响应**上。
+
+因此：**在 handler goroutine 之外写入的 goroutine，必须在 handler 返回前退出**。否则会写到别人的响应里。
+
+`c.Copy()` 解决不了这个问题——它把副本的 `writermem.ResponseWriter` 置为 nil，副本只能用来读请求参数与头部，不能写响应。需要在后台 goroutine 里做的事，只有两种正确形态：
+
+- 要写响应：goroutine 必须在 handler 返回前收尾（如下面模板里的心跳）
+- 只读请求元数据：用 `c.Copy()`，或提前把需要的值取成局部变量
+
+### 9.2 完整 handler 模板
+
+```go
+func OrderEvents(c *gin.Context) {
+    // 1. 鉴权与参数校验：必须全部在 Start() 之前完成，
+    //    此时还没有提交响应头，可以正常返回 JSON 错误。
+    uid := c.GetString("uid") // 由鉴权中间件写入
+    if uid == "" {
+        c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+        return
+    }
+    orderID := c.Param("id")
+    snapshot, err := svc.Load(c.Request.Context(), orderID, uid)
+    if err != nil {
+        c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "订单不存在"})
+        return
+    }
+
+    stream := ssex.NewStream(c.Writer, c.Request, ssex.WithWriteTimeout(10*time.Second))
+
+    // 2. 起流：失败时响应头尚未提交，仍可回 JSON。
+    if err := stream.Start(); err != nil {
+        handleStreamError(c, stream, err)
+        return
+    }
+
+    // 3. 先订阅、后发快照，避免漏掉两步之间的变更（见 6.7）。
+    events, release := hub.Subscribe(orderID)
+    defer release()
+
+    if err := stream.EventWithID(revID(snapshot), "status", snapshot); err != nil {
+        handleStreamError(c, stream, err)
+        return
+    }
+
+    // 4. 心跳：独立 ctx，并在 handler 返回前等它退出（见 9.1）。
+    hbCtx, stopHeartbeat := context.WithCancel(c.Request.Context())
+    hbErr := make(chan error, 1)
+    go func() { hbErr <- stream.Heartbeat(hbCtx, 15*time.Second) }()
+    defer func() {
+        stopHeartbeat()
+        <-hbErr
+    }()
+
+    // 5. 事件循环：四个退出口。
+    for {
+        select {
+        case <-appShutdown.Done(): // 应用停机（见 6.9）
+            _ = stream.Close(gin.H{"reason": "server shutting down"})
+            return
+
+        case <-stream.Context().Done(): // 客户端断开
+            return
+
+        case err := <-hbErr: // 心跳写失败，连接已不可用
+            handleStreamError(c, stream, err)
+            return
+
+        case e := <-events:
+            if err := stream.Send(e); err != nil {
+                handleStreamError(c, stream, err)
+                return
+            }
+            if isTerminal(e) { // 终态：主动结束，避免前端自动重连（见 6.4）
+                _ = stream.Close(gin.H{"reason": "final"})
+                return
+            }
+        }
+    }
+}
+```
+
+### 9.3 错误处理规范
+
+gin 场景最容易写错的是流已开始后又调用 `c.JSON`——响应头早已提交，再写普通响应体只会产生一个损坏的响应。用 `Started()` 分界：
+
+```go
+func handleStreamError(c *gin.Context, stream *ssex.Stream, err error) {
+    // 客户端断开与上下文取消是正常收尾，调试级记录即可
+    if errors.Is(err, ssex.ErrClientGone) || errors.Is(err, context.Canceled) {
+        logger.Debug("sse 客户端断开", zap.Error(err))
+        c.Abort()
+        return
+    }
+
+    // 写超时、序列化失败与未知写错误需要告警
+    _ = c.Error(err)
+    logger.Error("sse 写入失败", zap.Error(err))
+
+    if !stream.Started() {
+        // 响应头尚未提交，还能回普通 JSON
+        c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "建立事件流失败"})
+        return
+    }
+
+    // 已开始 SSE：只能记录并结束 handler
+    c.Abort()
+}
+```
+
+规则：
+
+| 条件 | 允许的动作 |
+|---|---|
+| `stream.Started() == false` | 可以 `c.JSON` / `AbortWithStatusJSON` 返回普通 JSON |
+| `stream.Started() == true` | 只能记录错误 + `c.Abort()`；**禁止** `c.JSON` / `c.String` / `AbortWithStatusJSON` |
+
+错误分级：`ErrClientGone` 与 `context.Canceled` 属正常收尾，调试级记录；`ErrWriteTimeout`、序列化错误与未知写错误需要告警。
+
+返回什么状态码与响应体是业务策略，因此库只提供 `Started()` 这个分界信号，不封装响应内容。
+
+### 9.4 中间件兼容
+
+SSE 路由要避开这几类中间件：
+
+| 类型 | 后果 |
+|---|---|
+| 响应体缓存 / 统一包装 | 帧被攒在中间层，前端收不到 |
+| 压缩（gzip 等） | 同上，`Flush` 只刷到压缩层（见 6.5） |
+| 固定请求总时长的 timeout | 长连接被按普通请求掐断 |
+| handler 返回后重写响应体 | 响应已提交，重写产生损坏响应 |
+| 把所有错误转成 JSON | 流已开始后再写 JSON 同样损坏响应 |
+
+鉴权、Recovery、Tracing 可以正常使用，但**鉴权必须在 `Start()` 之前完成**——起流之后就没法再回 401 了。
+
+用独立路由组隔离：
+
+```go
+sseGroup := router.Group("/events")
+sseGroup.Use(AuthMiddleware(), gin.Recovery()) // 不挂压缩、缓存、timeout
+sseGroup.GET("/orders/:id", OrderEvents)
+```
+
+### 9.5 兼容性测试
+
+gin 的集成由仓库内的独立模块 [gincompat](./gincompat) 持续验证（自带 `go.mod`，因此主模块的依赖清单里没有 gin）：
+
+```bash
+cd gincompat && go test -race ./...
+```
+
+覆盖：长连接不被 `http.Server.WriteTimeout` 截断、客户端断开判定为 `ErrClientGone`、Hub 端到端推送并由客户端 `Decode` 解回、心跳 goroutine 在 handler 返回前收尾（`-race` 下并发多轮）、起流前后错误处理分界、与 Recovery / Logger 中间件共存。
