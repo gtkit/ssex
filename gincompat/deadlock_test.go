@@ -69,7 +69,9 @@ func TestHeartbeatWriteErrorDoesNotBlockHandler(t *testing.T) {
 	engine := gin.New()
 	group := engine.Group("/events")
 	group.Use(func(c *gin.Context) {
-		c.Set("uid", "u1")
+		id := authedIdentity()
+		c.Set("uid", id.uid)
+		c.Set("tenant", id.tenant)
 		// 放过起流与首帧快照，随后的心跳写入必失败
 		c.Writer = &failingWriter{ResponseWriter: c.Writer, after: 2}
 		c.Next()
@@ -96,7 +98,7 @@ func TestHeartbeatWriteErrorDoesNotBlockHandler(t *testing.T) {
 	}
 
 	// defer release() 必须执行到
-	waitFor(t, "连接注销", func() bool { return hub.Online("o1") == 0 })
+	waitFor(t, "连接注销", func() bool { return hub.Online(keyFor("t1", "o1")) == 0 })
 
 	select {
 	case err := <-observed:

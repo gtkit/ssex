@@ -6,6 +6,7 @@ package gincompat
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -21,13 +22,38 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
+// identity 是鉴权中间件注入到 gin.Context 的身份。
+type identity struct {
+	uid    string
+	tenant string
+}
+
+// resource 是授权通过后返回的内部安全标识。后续所有操作都用它，
+// 避免"授权用 tenantID+orderID、读快照只用 orderID"这种作用域漂移——
+// 若 orderID 只在租户内唯一，漂移会让快照读到另一个租户的数据。
+type resource struct {
+	tenantID   string
+	internalID string
+}
+
+// scopeKey 生成 Hub key。统一封装、禁止业务代码自行拼接：
+// 直接 tenantID + ":" + orderID 在任一段含分隔符时会碰撞——
+// ("a:b", "c") 与 ("a", "b:c") 会得到同一个 key。这里用长度前缀编码，
+// 任何取值都不会碰撞。
+func (r resource) scopeKey() string {
+	return fmt.Sprintf("%d:%s:%d:%s", len(r.tenantID), r.tenantID, len(r.internalID), r.internalID)
+}
+
 // orderEventsDeps 是模板 handler 需要的依赖，测试按用例注入。
 type orderEventsDeps struct {
 	hub         *ssex.Hub
 	appShutdown context.Context
-	// load 从持久化事实源读快照，返回单调递增的 revision 与载荷。
-	// 为 nil 时用一个固定的 pending 快照。
-	load func(ctx context.Context, orderID string) (int64, gin.H, error)
+	// authorize 校验身份对资源的访问权，返回内部安全标识。
+	// 为 nil 时默认放行并以 tenantID + orderID 构造标识。
+	authorize func(ctx context.Context, id identity, orderID string) (resource, error)
+	// load 用已授权的内部标识读快照，返回单调递增的 revision 与载荷。
+	// 注意它接收 resource 而不是裸 orderID：作用域必须与授权阶段一致。
+	load func(ctx context.Context, res resource) (int64, gin.H, error)
 	// onStreamError 记录 handler 观察到的错误，供断言。
 	onStreamError func(started bool, err error)
 	// onInvalidRevision 在事件缺少有效 revision 时被调用（生产上应告警）。
@@ -52,28 +78,48 @@ func revisionOf(e ssex.Event) (int64, bool) {
 // orderEvents 是 README 9.2 的模板 handler。
 func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 1. 鉴权与参数校验都在 Start() 之前
-		uid := c.GetString("uid")
-		if uid == "" {
+		// 1. 认证：都在 Start() 之前，此时还能正常返回 JSON 错误。
+		//    空身份必须在进入 Hub 之前拒掉——Hub 不校验 key，空 key 会让所有
+		//    认证异常的请求共享同一个队列、互相收到对方的事件。
+		id := identity{uid: c.GetString("uid"), tenant: c.GetString("tenant")}
+		if id.uid == "" || id.tenant == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
 
 			return
 		}
 		orderID := c.Param("id")
 
-		// 2. 先订阅，再读快照。顺序反过来会永久漏事件：Load 与 Subscribe 之间
+		// 2. 资源授权：与"读快照"分开做。授权是廉价的归属检查，先做掉可以避免
+		//    产生未授权订阅（会让 Online 出现伪在线）。返回内部安全标识。
+		authorize := deps.authorize
+		if authorize == nil {
+			authorize = func(_ context.Context, id identity, orderID string) (resource, error) {
+				return resource{tenantID: id.tenant, internalID: orderID}, nil
+			}
+		}
+		res, err := authorize(c.Request.Context(), id, orderID)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "无权访问"})
+
+			return
+		}
+
+		// 3. key 由服务端从已授权资源计算，带租户作用域
+		key := res.scopeKey()
+
+		// 4. 先订阅，再读快照。顺序反过来会永久漏事件：Load 与 Subscribe 之间
 		//    发生的状态变更此时无人订阅，推送直接丢弃，客户端会永远停在旧快照上。
-		events, release := deps.hub.Subscribe(orderID)
+		events, release := deps.hub.Subscribe(key)
 		defer release()
 
-		// 3. 从事实源读快照。失败时还没起流，可以回普通 JSON。
+		// 5. 用同一个已验证标识读快照——不能退回只用裸 orderID，否则作用域漂移。
 		load := deps.load
 		if load == nil {
-			load = func(context.Context, string) (int64, gin.H, error) {
+			load = func(context.Context, resource) (int64, gin.H, error) {
 				return 1, gin.H{"status": "pending"}, nil
 			}
 		}
-		snapRev, snapshot, err := load(c.Request.Context(), orderID)
+		snapRev, snapshot, err := load(c.Request.Context(), res)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "订单不存在"})
 
@@ -82,21 +128,21 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 
 		stream := ssex.NewStream(c.Writer, c.Request, ssex.WithWriteTimeout(10*time.Second))
 
-		// 4. 起流失败时响应头尚未提交，仍可回 JSON
+		// 6. 起流失败时响应头尚未提交，仍可回 JSON
 		if err := stream.Start(); err != nil {
 			handleStreamError(c, stream, deps, err)
 
 			return
 		}
 
-		// 5. 发快照，revision 放进事件 id
+		// 7. 发快照，revision 放进事件 id
 		if err := stream.EventWithID(strconv.FormatInt(snapRev, 10), "status", snapshot); err != nil {
 			handleStreamError(c, stream, deps, err)
 
 			return
 		}
 
-		// 6. 心跳：独立 ctx；错误走 hbErr，"已退出"走 hbDone。
+		// 8. 心跳：独立 ctx；错误走 hbErr，"已退出"走 hbDone。
 		//    两者必须分开：若用同一个 channel 兼任，主循环的 case 消费掉唯一那次
 		//    发送后，defer 里的第二次接收就永远等不到发送者——handler 永久阻塞，
 		//    连排在后面的 release() 都不会执行。hbDone 用 close，读多少次都不会阻塞。
@@ -114,7 +160,7 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 			<-hbDone
 		}()
 
-		// 7. 事件循环：四个退出口。lastRev 从快照起步并随成功发送推进——
+		// 9. 事件循环：四个退出口。lastRev 从快照起步并随成功发送推进——
 		//    只比快照不够：Hub 不保证跨推送方的到达顺序，快照之后仍可能先到
 		//    revision 10、后到 revision 9，只比快照会把 9 也转发出去，前端状态回退。
 		lastRev := snapRev
@@ -189,12 +235,15 @@ func handleStreamError(c *gin.Context, stream *ssex.Stream, deps orderEventsDeps
 }
 
 // newEngine 组装带鉴权中间件的 SSE 路由组（README 9.4）。
-func newEngine(deps orderEventsDeps, uid string) *gin.Engine {
+func newEngine(deps orderEventsDeps, id identity) *gin.Engine {
 	engine := gin.New()
 	group := engine.Group("/events")
 	group.Use(gin.Recovery(), func(c *gin.Context) {
-		if uid != "" {
-			c.Set("uid", uid)
+		if id.uid != "" {
+			c.Set("uid", id.uid)
+		}
+		if id.tenant != "" {
+			c.Set("tenant", id.tenant)
 		}
 		c.Next()
 	})
@@ -203,11 +252,21 @@ func newEngine(deps orderEventsDeps, uid string) *gin.Engine {
 	return engine
 }
 
+// authedIdentity 是测试里默认使用的一个已认证身份。
+func authedIdentity() identity {
+	return identity{uid: "u1", tenant: "t1"}
+}
+
+// keyFor 复现 handler 内部的 key 计算，供测试向正确的 key 推送。
+func keyFor(tenantID, orderID string) string {
+	return resource{tenantID: tenantID, internalID: orderID}.scopeKey()
+}
+
 func TestAuthRejectedBeforeStream(t *testing.T) {
 	t.Parallel()
 
 	deps := orderEventsDeps{hub: ssex.NewHub(), appShutdown: context.Background()}
-	server := httptest.NewServer(newEngine(deps, "")) // 不注入 uid
+	server := httptest.NewServer(newEngine(deps, identity{})) // 不注入 uid
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/events/orders/o1")
@@ -235,7 +294,7 @@ func TestPushAndTerminalClose(t *testing.T) {
 		appShutdown: context.Background(),
 		terminal:    func(e ssex.Event) bool { return e.Name == "status" && e.ID == "2" },
 	}
-	server := httptest.NewServer(newEngine(deps, "u1"))
+	server := httptest.NewServer(newEngine(deps, authedIdentity()))
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/events/orders/o1")
@@ -251,8 +310,8 @@ func TestPushAndTerminalClose(t *testing.T) {
 		t.Fatalf("X-Accel-Buffering = %q, want no", got)
 	}
 
-	waitFor(t, "handler 完成 Subscribe", func() bool { return hub.Online("o1") == 1 })
-	hub.Push("o1", ssex.Event{ID: "2", Name: "status", Data: gin.H{"status": "paid"}})
+	waitFor(t, "handler 完成 Subscribe", func() bool { return hub.Online(keyFor("t1", "o1")) == 1 })
+	hub.Push(keyFor("t1", "o1"), ssex.Event{ID: "2", Name: "status", Data: gin.H{"status": "paid"}})
 
 	var names []string
 	for msg, err := range ssex.Decode(resp.Body) {
@@ -282,7 +341,7 @@ func TestHeartbeatGoroutineExitsBeforeHandlerReturns(t *testing.T) {
 	t.Parallel()
 
 	deps := orderEventsDeps{hub: ssex.NewHub(), appShutdown: context.Background()}
-	server := httptest.NewServer(newEngine(deps, "u1"))
+	server := httptest.NewServer(newEngine(deps, authedIdentity()))
 	defer server.Close()
 
 	const (
@@ -314,7 +373,7 @@ func TestHeartbeatGoroutineExitsBeforeHandlerReturns(t *testing.T) {
 	wg.Wait()
 
 	// 所有 handler 退出后注册表应清空，说明 defer release() 都执行了
-	waitFor(t, "全部连接注销", func() bool { return deps.hub.Online("o1") == 0 })
+	waitFor(t, "全部连接注销", func() bool { return deps.hub.Online(keyFor("t1", "o1")) == 0 })
 }
 
 // TestSurvivesServerWriteTimeout 验证 gin 下长连接不被 http.Server.WriteTimeout 截断,
@@ -511,7 +570,7 @@ func TestAppShutdownClosesStream(t *testing.T) {
 
 	shutdown, triggerShutdown := context.WithCancel(context.Background())
 	deps := orderEventsDeps{hub: ssex.NewHub(), appShutdown: shutdown}
-	server := httptest.NewServer(newEngine(deps, "u1"))
+	server := httptest.NewServer(newEngine(deps, authedIdentity()))
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/events/orders/o1")
@@ -520,7 +579,7 @@ func TestAppShutdownClosesStream(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	waitFor(t, "handler 完成 Subscribe", func() bool { return deps.hub.Online("o1") == 1 })
+	waitFor(t, "handler 完成 Subscribe", func() bool { return deps.hub.Online(keyFor("t1", "o1")) == 1 })
 	triggerShutdown()
 
 	sawClose := false

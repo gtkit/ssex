@@ -34,11 +34,20 @@ func WithQueueSize(n int) HubOption {
 // 或用一致性哈希把同一 key 的连接与事件路由到同一实例。存储始终是事实源，
 // Hub 只是加速通道。AI 对话流在 handler 内直连上游、不经 Hub，不受此限制。
 //
-// key 的安全作用域：key 就是一个字符串，两个不同租户的 orderID=100 会落进同一个
-// key，造成跨租户状态串流。key MUST 由已认证身份与已授权资源计算（如
-// tenantID:userID:orderID），不能直接用 URL、query 或客户端传入的值；
-// 尤其不能为空——空 key 会让所有认证异常的请求共享同一个队列、互相收到对方的事件。
-// Broadcast 只用于确实允许所有在线用户看到的内容。
+// key 的安全作用域：**Hub 不校验 key**，它只把 key 当成一个不透明字符串——
+// 包括空串在内的任何值都能订阅成功。因此作用域治理完全由调用方负责：
+//
+//   - key 必须由已认证身份与已授权资源计算，不能直接用 URL、query 或客户端传入的值；
+//   - 必须非空：空 key 会让所有认证异常的请求共享同一个队列、互相收到对方的事件，
+//     调用方应在 Subscribe 之前拒掉空身份；
+//   - 多租户必须带 tenant 作用域，且不要用裸拼接——"a:b"+":"+"c" 与 "a"+":"+"b:c"
+//     会得到同一个 key。用长度前缀编码或服务端生成的全局唯一 ID，并统一封装成
+//     一个 key 构造函数，禁止业务代码各自拼接；
+//   - 读取资源时要沿用授权阶段的同一作用域标识，不要退回裸资源 ID，否则快照可能
+//     读到另一个租户的数据；
+//   - Broadcast 只用于确实允许所有在线用户看到的内容。
+//
+// README 第 9 节给出了完整写法，gincompat 里有对应的可执行版本与跨租户回归测试。
 //
 // 适用边界：Hub 面向**状态推送**——每条事件自带完整状态，队列满时挤掉旧的、
 // 保留最新的（latest-wins）即可。AI token 流每一条都是文本的一部分，
@@ -108,11 +117,13 @@ func NewHub(opts ...HubOption) *Hub {
 // 关闭它会与并发的 Push 构成"向已关闭 channel 发送"的 panic 竞态。
 // 用连接上下文结束消费循环：
 //
-//	events, release := hub.Subscribe(uid)
+//	// key 由服务端从已授权资源计算,统一走构造函数、不要裸拼接
+//	events, release := hub.Subscribe(res.ScopeKey())
 //	defer release()
 //
-//	// 订阅之后再读快照,否则两步之间的状态变更无人接收、会永久丢失
-//	snapRev, snapshot, err := svc.Load(r.Context(), uid)
+//	// 订阅之后再读快照,否则两步之间的状态变更无人接收、会永久丢失;
+//	// 用授权阶段返回的同一标识,不要退回裸资源 ID
+//	snapRev, snapshot, err := svc.Load(r.Context(), res)
 //	if err != nil {
 //	    // 尚未起流,这里还能回普通 JSON
 //	    return

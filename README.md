@@ -523,7 +523,11 @@ AI 对话流在 handler 内直连上游、不经 Hub，因此不受这条限制�
 - key 只能由**已认证身份 + 已授权资源**计算，不能直接用 URL、query 或客户端传入的值
 - 多租户必须带 tenant 作用域，如 `tenantID:userID:orderID`，或用服务端生成的全局唯一不可猜测 ID
 - **禁止空 key**：空 key 会让所有认证异常的请求共享同一个队列、互相收到对方的事件
+- **不要裸拼接**：`"a:b" + ":" + "c"` 与 `"a" + ":" + "b:c"` 会得到同一个 key。用长度前缀编码或服务端生成的全局唯一 ID，并统一封装成一个 key 构造函数，禁止业务代码各自拼接
+- **读资源时沿用授权阶段的同一标识**，不要退回裸资源 ID——否则快照可能读到另一个租户的数据
 - `Broadcast` 只用于确实允许所有在线用户看到的内容
+
+`gincompat` 里的 `resource.scopeKey()` 用长度前缀编码做了示范，并有 `TestScopeKeyHasNoCollision` 与走真实 handler 的 `TestTenantCannotReachOtherTenantOrder` 两个回归测试。
 
 ## 5. 常见模式
 
@@ -667,10 +671,18 @@ SSE 只适合：
 - 先订阅时，快照的 revision 可能比队列里已有的事件旧，按 revision 取大者即可，别让旧事件覆盖新快照
 
 ```go
-events, release := hub.Subscribe(uid)   // 先订阅
+res, err := svc.Authorize(ctx, tenantID, uid, orderToken) // 先授权，拿到内部安全标识
+if err != nil {
+    return err
+}
+
+events, release := hub.Subscribe(res.ScopeKey())          // 再订阅
 defer release()
 
-snapshot := svc.Load(ctx, orderToken)   // 后取快照
+snapshot, err := svc.Load(ctx, res)                       // 后取快照，沿用同一标识
+if err != nil {
+    return err
+}
 _ = stream.EventWithID(strconv.FormatInt(snapshot.Revision, 10), "status", snapshot)
 ```
 
@@ -798,22 +810,26 @@ func OrderEvents(c *gin.Context) {
 
     // 2. 资源授权：与"读快照"分开做。授权是廉价的归属检查，先做掉可以避免
     //    产生未授权订阅（会让 Online 出现伪在线）。
-    if err := svc.Authorize(c.Request.Context(), tenantID, uid, orderID); err != nil {
+    //    它返回一个内部安全标识，后续所有操作都用它——避免"授权带 tenantID、
+    //    读快照只用 orderID"这种作用域漂移读到别的租户数据。
+    res, err := svc.Authorize(c.Request.Context(), tenantID, uid, orderID)
+    if err != nil {
         c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "无权访问"})
         return
     }
 
-    // 3. key 由服务端身份与已授权资源计算，带租户作用域——直接用 orderID 会让
-    //    不同租户的同名 ID 落进同一个 key，造成跨租户串流（见 4.15）。
-    key := tenantID + ":" + orderID
+    // 3. key 由服务端从已授权资源计算。统一走一个构造函数，禁止业务代码各自拼接：
+    //    裸拼接 tenantID + ":" + orderID 在任一段含分隔符时会碰撞
+    //    （"a:b"+":"+"c" 与 "a"+":"+"b:c" 得到同一个 key），见 4.15。
+    key := res.ScopeKey()
 
     // 4. 先订阅，再读快照。顺序反过来会永久漏事件：Load 与 Subscribe 之间发生的
     //    状态变更此时无人订阅，推送直接丢弃，客户端会永远停在旧快照上（见 6.7）。
     events, release := hub.Subscribe(key)
     defer release()
 
-    // 5. 从持久化事实源读快照。失败时还没起流，可以回普通 JSON。
-    snapRev, snapshot, err := svc.Load(c.Request.Context(), orderID)
+    // 5. 用同一个已验证标识读快照，不能退回裸 orderID。失败时还没起流，可以回 JSON。
+    snapRev, snapshot, err := svc.Load(c.Request.Context(), res)
     if err != nil {
         c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "订单不存在"})
         return

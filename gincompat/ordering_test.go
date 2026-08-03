@@ -25,9 +25,9 @@ func TestNoEventLossBetweenSubscribeAndSnapshot(t *testing.T) {
 	deps := orderEventsDeps{
 		hub:         hub,
 		appShutdown: context.Background(),
-		load: func(_ context.Context, orderID string) (int64, gin.H, error) {
+		load: func(_ context.Context, res resource) (int64, gin.H, error) {
 			// 读快照期间支付回调到达：此刻必须已经订阅，否则这条 paid 永久丢失
-			hub.Push(orderID, ssex.Event{ID: "5", Name: "status", Data: gin.H{"status": "paid"}})
+			hub.Push(res.scopeKey(), ssex.Event{ID: "5", Name: "status", Data: gin.H{"status": "paid"}})
 
 			// 快照仍是这次变更之前的版本（revision 1）
 			return 1, gin.H{"status": "pending"}, nil
@@ -35,7 +35,7 @@ func TestNoEventLossBetweenSubscribeAndSnapshot(t *testing.T) {
 		terminal: func(e ssex.Event) bool { return e.ID == "5" },
 	}
 
-	server := httptest.NewServer(newEngine(deps, "u1"))
+	server := httptest.NewServer(newEngine(deps, authedIdentity()))
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/events/orders/o1")
@@ -72,17 +72,17 @@ func TestStaleEventsSkippedByRevision(t *testing.T) {
 	deps := orderEventsDeps{
 		hub:         hub,
 		appShutdown: context.Background(),
-		load: func(_ context.Context, orderID string) (int64, gin.H, error) {
+		load: func(_ context.Context, res resource) (int64, gin.H, error) {
 			// 订阅之后积压两条旧事件，它们的变更已经包含在下面这个 revision 7 的快照里
-			hub.Push(orderID, ssex.Event{ID: "3", Name: "status", Data: gin.H{"status": "created"}})
-			hub.Push(orderID, ssex.Event{ID: "7", Name: "status", Data: gin.H{"status": "pending"}})
+			hub.Push(res.scopeKey(), ssex.Event{ID: "3", Name: "status", Data: gin.H{"status": "created"}})
+			hub.Push(res.scopeKey(), ssex.Event{ID: "7", Name: "status", Data: gin.H{"status": "pending"}})
 
 			return 7, gin.H{"status": "pending"}, nil
 		},
 		terminal: func(e ssex.Event) bool { return e.ID == "9" },
 	}
 
-	server := httptest.NewServer(newEngine(deps, "u1"))
+	server := httptest.NewServer(newEngine(deps, authedIdentity()))
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/events/orders/o1")
@@ -91,8 +91,8 @@ func TestStaleEventsSkippedByRevision(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	waitFor(t, "handler 完成订阅", func() bool { return hub.Online("o1") == 1 })
-	hub.Push("o1", ssex.Event{ID: "9", Name: "status", Data: gin.H{"status": "paid"}})
+	waitFor(t, "handler 完成订阅", func() bool { return hub.Online(keyFor("t1", "o1")) == 1 })
+	hub.Push(keyFor("t1", "o1"), ssex.Event{ID: "9", Name: "status", Data: gin.H{"status": "paid"}})
 
 	var got []string
 	for msg, err := range ssex.Decode(resp.Body) {
@@ -124,13 +124,13 @@ func TestOutOfOrderEventsDoNotRegress(t *testing.T) {
 	deps := orderEventsDeps{
 		hub:         hub,
 		appShutdown: context.Background(),
-		load: func(_ context.Context, _ string) (int64, gin.H, error) {
+		load: func(_ context.Context, _ resource) (int64, gin.H, error) {
 			return 7, gin.H{"status": "pending"}, nil
 		},
 		terminal: func(e ssex.Event) bool { return e.ID == "12" },
 	}
 
-	server := httptest.NewServer(newEngine(deps, "u1"))
+	server := httptest.NewServer(newEngine(deps, authedIdentity()))
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/events/orders/o1")
@@ -139,12 +139,12 @@ func TestOutOfOrderEventsDoNotRegress(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	waitFor(t, "handler 完成订阅", func() bool { return hub.Online("o1") == 1 })
+	waitFor(t, "handler 完成订阅", func() bool { return hub.Online(keyFor("t1", "o1")) == 1 })
 
 	// 先到新版本，再到乱序的旧版本，最后到终态
-	hub.Push("o1", ssex.Event{ID: "10", Name: "status", Data: gin.H{"status": "paid"}})
-	hub.Push("o1", ssex.Event{ID: "9", Name: "status", Data: gin.H{"status": "pending"}})
-	hub.Push("o1", ssex.Event{ID: "12", Name: "status", Data: gin.H{"status": "delivered"}})
+	hub.Push(keyFor("t1", "o1"), ssex.Event{ID: "10", Name: "status", Data: gin.H{"status": "paid"}})
+	hub.Push(keyFor("t1", "o1"), ssex.Event{ID: "9", Name: "status", Data: gin.H{"status": "pending"}})
+	hub.Push(keyFor("t1", "o1"), ssex.Event{ID: "12", Name: "status", Data: gin.H{"status": "delivered"}})
 
 	var got []string
 	for msg, err := range ssex.Decode(resp.Body) {
@@ -177,13 +177,13 @@ func TestInvalidRevisionIsReportedNotSilentlyDropped(t *testing.T) {
 		hub:               hub,
 		appShutdown:       context.Background(),
 		onInvalidRevision: func(e ssex.Event) { reported <- e },
-		load: func(_ context.Context, _ string) (int64, gin.H, error) {
+		load: func(_ context.Context, _ resource) (int64, gin.H, error) {
 			return 1, gin.H{"status": "pending"}, nil
 		},
 		terminal: func(e ssex.Event) bool { return e.ID == "5" },
 	}
 
-	server := httptest.NewServer(newEngine(deps, "u1"))
+	server := httptest.NewServer(newEngine(deps, authedIdentity()))
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/events/orders/o1")
@@ -192,10 +192,10 @@ func TestInvalidRevisionIsReportedNotSilentlyDropped(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	waitFor(t, "handler 完成订阅", func() bool { return hub.Online("o1") == 1 })
+	waitFor(t, "handler 完成订阅", func() bool { return hub.Online(keyFor("t1", "o1")) == 1 })
 
-	hub.Push("o1", ssex.Event{Name: "status", Data: gin.H{"status": "paid"}}) // 没填 ID
-	hub.Push("o1", ssex.Event{ID: "5", Name: "status", Data: gin.H{"status": "delivered"}})
+	hub.Push(keyFor("t1", "o1"), ssex.Event{Name: "status", Data: gin.H{"status": "paid"}}) // 没填 ID
+	hub.Push(keyFor("t1", "o1"), ssex.Event{ID: "5", Name: "status", Data: gin.H{"status": "delivered"}})
 
 	for msg, err := range ssex.Decode(resp.Body) {
 		if err != nil {
@@ -226,7 +226,7 @@ func TestEmptyKeyIsRejectedBeforeSubscribe(t *testing.T) {
 
 	hub := ssex.NewHub()
 	deps := orderEventsDeps{hub: hub, appShutdown: context.Background()}
-	server := httptest.NewServer(newEngine(deps, "")) // 中间件不注入 uid
+	server := httptest.NewServer(newEngine(deps, identity{})) // 中间件不注入 uid
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/events/orders/o1")
@@ -243,36 +243,111 @@ func TestEmptyKeyIsRejectedBeforeSubscribe(t *testing.T) {
 	if got := hub.Online(""); got != 0 {
 		t.Fatalf(`Online("") = %d, want 0（空 key 进了 Hub，认证异常的请求会互相串流）`, got)
 	}
-	if got := hub.Online("o1"); got != 0 {
+	if got := hub.Online(keyFor("t1", "o1")); got != 0 {
 		t.Fatalf(`Online("o1") = %d, want 0`, got)
 	}
 }
 
-// TestKeyScopeIsolatesTenants 验证带租户作用域的 key 不会跨租户串流。
+// TestScopeKeyHasNoCollision 验证 scopeKey 的长度前缀编码不会碰撞。
 //
-// 直接用 orderID 作为 key 时，两个租户的 orderID=100 会落进同一个 key。
-func TestKeyScopeIsolatesTenants(t *testing.T) {
+// 直接 tenantID + ":" + orderID 时，("a:b","c") 与 ("a","b:c") 会得到同一个 key，
+// 两个不相关的资源就此共享事件队列。
+func TestScopeKeyHasNoCollision(t *testing.T) {
+	t.Parallel()
+
+	first := resource{tenantID: "a:b", internalID: "c"}.scopeKey()
+	second := resource{tenantID: "a", internalID: "b:c"}.scopeKey()
+
+	if first == second {
+		t.Fatalf("scopeKey 碰撞: %q == %q（含分隔符的取值必须产生不同 key）", first, second)
+	}
+}
+
+// TestTenantCannotReachOtherTenantOrder 验证跨租户隔离走的是真实 handler 链路：
+// 从 gin.Context 取 tenant → 资源授权 → 计算 scoped key → Subscribe → 同作用域读快照。
+//
+// 两个租户用的是**同一个 orderID**。若 key 不带租户作用域（直接用 orderID），
+// 租户 B 的连接会收到租户 A 的订单状态。
+func TestTenantCannotReachOtherTenantOrder(t *testing.T) {
 	t.Parallel()
 
 	hub := ssex.NewHub(ssex.WithQueueSize(4))
-
-	tenantA, releaseA := hub.Subscribe("tenantA:100")
-	defer releaseA()
-	tenantB, releaseB := hub.Subscribe("tenantB:100")
-	defer releaseB()
-
-	if delivered, _ := hub.Push("tenantA:100", ssex.Event{ID: "1", Name: "status"}); delivered != 1 {
-		t.Fatalf("Push delivered = %d, want 1", delivered)
+	deps := orderEventsDeps{
+		hub:         hub,
+		appShutdown: context.Background(),
+		// 每个租户只能访问自己的订单；返回的内部标识带租户作用域
+		authorize: func(_ context.Context, id identity, orderID string) (resource, error) {
+			return resource{tenantID: id.tenant, internalID: orderID}, nil
+		},
+		load: func(_ context.Context, res resource) (int64, gin.H, error) {
+			return 1, gin.H{"tenant": res.tenantID}, nil
+		},
+		terminal: func(e ssex.Event) bool { return e.ID == "9" },
 	}
 
+	// 两个租户，同一个 orderID
+	serverA := httptest.NewServer(newEngine(deps, identity{uid: "uA", tenant: "tenantA"}))
+	defer serverA.Close()
+	serverB := httptest.NewServer(newEngine(deps, identity{uid: "uB", tenant: "tenantB"}))
+	defer serverB.Close()
+
+	respA, err := http.Get(serverA.URL + "/events/orders/100")
+	if err != nil {
+		t.Fatalf("租户 A GET failed: %v", err)
+	}
+	defer func() { _ = respA.Body.Close() }()
+
+	respB, err := http.Get(serverB.URL + "/events/orders/100")
+	if err != nil {
+		t.Fatalf("租户 B GET failed: %v", err)
+	}
+	defer func() { _ = respB.Body.Close() }()
+
+	keyA := keyFor("tenantA", "100")
+	keyB := keyFor("tenantB", "100")
+	waitFor(t, "两个租户都完成订阅", func() bool {
+		return hub.Online(keyA) == 1 && hub.Online(keyB) == 1
+	})
+
+	// 只向租户 A 的 scoped key 推送
+	if delivered, _ := hub.Push(keyA, ssex.Event{ID: "9", Name: "status", Data: gin.H{"status": "paid"}}); delivered != 1 {
+		t.Fatalf("Push 到 keyA delivered = %d, want 1", delivered)
+	}
+
+	// 租户 A 应收到快照 + paid + close
+	var gotA []string
+	for msg, err := range ssex.Decode(respA.Body) {
+		if err != nil {
+			t.Fatalf("租户 A decode: %v", err)
+		}
+		gotA = append(gotA, msg.ID)
+		if msg.Name == "close" {
+			break
+		}
+	}
+	if len(gotA) != 3 || gotA[1] != "9" {
+		t.Fatalf("租户 A event ids = %v, want [1 9 ...]", gotA)
+	}
+
+	// 租户 B 只应有自己的快照，绝不能出现 rev 9
+	if hub.Online(keyB) != 1 {
+		t.Fatalf("租户 B 的订阅意外消失")
+	}
 	select {
-	case <-tenantA:
-	default:
-		t.Fatal("租户 A 未收到自己的事件")
-	}
-	select {
-	case e := <-tenantB:
-		t.Fatalf("租户 B 收到了租户 A 的事件: %+v", e)
+	case leaked := <-eventsOf(t, hub, keyB):
+		t.Fatalf("租户 B 收到了租户 A 的事件: %+v", leaked)
 	default:
 	}
+}
+
+// eventsOf 额外订阅一次同一个 key，用于检查是否有事件泄漏到该 key。
+// 它订阅的是新连接，因此只会收到订阅之后投递的事件——本测试用它确认
+// 推送给租户 A 的事件没有落到租户 B 的 key 上。
+func eventsOf(t *testing.T, hub *ssex.Hub, key string) <-chan ssex.Event {
+	t.Helper()
+
+	events, release := hub.Subscribe(key)
+	t.Cleanup(release)
+
+	return events
 }

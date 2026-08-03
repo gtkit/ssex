@@ -12,8 +12,11 @@
 - README 新增「Gin 集成」一节：完整 handler 模板（鉴权 → 起流错误 → 先订阅后快照 → 心跳收尾 → 四出口事件循环）、以 `Started()` 分界的错误处理规范与错误分级、中间件兼容清单与路由组隔离、`c.Writer` 生命周期约束。
 
 ### Fixed
+- ⚠ 修复 README 与 `gincompat` 可执行模板的漂移：README 声称"模板的可执行版本在 `gincompat/handler_test.go`，模板变化会导致测试失败"，但上一轮只改了 README——`gincompat` 的 handler 仍只检查 uid、直接用裸 `orderID` 订阅、`load` 不带租户作用域。因此远端 CI 全绿也无法证明 README 新增的租户隔离与授权顺序是正确的。已让 `gincompat` handler 与 README 9.2 完全对齐（identity/tenant、资源授权、scoped key、同作用域读快照），并补上走真实 handler 链路的跨租户回归测试。
+- ⚠ 修复完整模板的作用域漂移：授权用 `Authorize(ctx, tenantID, uid, orderID)`，读快照却只用 `Load(ctx, orderID)`。若 `orderID` 只在租户内唯一，快照可能读到另一个租户的数据。已改为授权返回内部安全标识、后续 `ScopeKey()` 与 `Load` 都沿用它。
+- 修复 key 的分隔符碰撞：`tenantID + ":" + orderID` 在任一段含分隔符时会碰撞（`"a:b"+":"+"c"` 与 `"a"+":"+"b:c"` 得到同一个 key，两个不相关资源共享事件队列）。示范实现改用长度前缀编码并封装成统一构造函数，新增 `TestScopeKeyHasNoCollision`。
 - ⚠ 修复简版 Hub handler 模板仍是"先 `Start` 后 `Subscribe`"：`Start` 最坏要等一个完整的 `WithWriteTimeout`，这段时间里的推送无人订阅、永久丢失。已改为先订阅再起流。
-- ⚠ 修复简版模板读取 `uid` 但不检查空串：空 key 会让所有认证异常的请求共享同一个队列、互相收到对方的事件。模板改为在 `Subscribe` 之前拒掉空 key，并新增回归测试断言空 key 不进入注册表。
+- ⚠ 修复简版模板读取 `uid` 但不检查空串：空 key 会让所有认证异常的请求共享同一个队列、互相收到对方的事件。模板改为在 `Subscribe` 之前拒掉空身份，并新增回归测试断言空 key 不进入注册表。注意这是**应用层**约束：`Hub.Subscribe` 不校验 key（校验需要给它加 error 返回，属破坏性变更），`Hub` 的 GoDoc 已明确把 key 的作用域治理责任写给调用方。
 - ⚠ 修正 README 把 `delivered == 0` 当作"是否落库"判据的危险示例：`delivered` 只表示入队的本机连接数，不代表客户端收到、`Flush` 成功、其他实例的连接收到，也不代表事件没被后续溢出挤掉。已改为"先在事务里持久化状态与 revision、提交成功、再发布事件"，`delivered` / `dropped` 只用于监控。该表述此前与 6.7 的"存储是唯一事实源"直接矛盾。
 - 修复 `Hub.Subscribe` 的 GoDoc 示例仍是只与快照比较的旧过滤方式（漏改，而 GoDoc 直接出现在 IDE 与 pkg.go.dev）：改为维护 `lastRev`、处理 revision 解析失败，并补上入队不等于交付、key 需带租户作用域、Hub 仅限当前进程三条说明。
 - 修正 README 9.2 把整个 `Event` 写进日志的示例：`Event.Data` 可能含身份信息、登录 token、订单详情或 AI 对话内容。改为只记 key 脱敏值、`Event.ID` / `Event.Name`、载荷类型与 Trace ID。
