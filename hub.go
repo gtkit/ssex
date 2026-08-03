@@ -27,6 +27,19 @@ func WithQueueSize(n int) HubOption {
 // 典型用途是带外推送：支付回调推订单状态、后台踢下线推登录态——
 // 产生事件的 goroutine 并不持有连接。
 //
+// 进程边界：Hub 只管**当前进程**的连接。多实例部署时，连接在实例 A 而支付回调
+// 打到实例 B，实例 B 的 Push 找不到那条连接、返回 delivered == 0，前端收不到更新；
+// Online 也只反映本机而非集群。单实例可直接用；多实例必须让每个实例都收到状态
+// 事件（Outbox / MQ / Redis Pub/Sub 广播式消费），再各自 Push 给本地 Hub，
+// 或用一致性哈希把同一 key 的连接与事件路由到同一实例。存储始终是事实源，
+// Hub 只是加速通道。AI 对话流在 handler 内直连上游、不经 Hub，不受此限制。
+//
+// key 的安全作用域：key 就是一个字符串，两个不同租户的 orderID=100 会落进同一个
+// key，造成跨租户状态串流。key MUST 由已认证身份与已授权资源计算（如
+// tenantID:userID:orderID），不能直接用 URL、query 或客户端传入的值；
+// 尤其不能为空——空 key 会让所有认证异常的请求共享同一个队列、互相收到对方的事件。
+// Broadcast 只用于确实允许所有在线用户看到的内容。
+//
 // 适用边界：Hub 面向**状态推送**——每条事件自带完整状态，队列满时挤掉旧的、
 // 保留最新的（latest-wins）即可。AI token 流每一条都是文本的一部分，
 // 少一条就损坏输出，应在 handler 内直接用 Stream.Data 写出，不经 Hub。
@@ -113,21 +126,33 @@ func NewHub(opts ...HubOption) *Hub {
 //	    return
 //	}
 //
+//	lastRev := snapRev // 随成功发送推进,不能只与快照比
 //	for {
 //	    select {
 //	    case <-stream.Context().Done():
 //	        return
 //	    case e := <-events:
-//	        if revisionOf(e) <= snapRev { // 快照里已经含了的旧事件,跳过
+//	        rev, ok := revisionOf(e)
+//	        if !ok {
+//	            // 生产者没填 revision:告警而不是静默丢弃。日志只记 key 脱敏值、
+//	            // Event.ID / Name 与载荷类型,不要序列化整个 Data。
+//	            continue
+//	        }
+//	        if rev <= lastRev { // 积压的旧事件,或乱序到达的回退版本
 //	            continue
 //	        }
 //	        if err := stream.Send(e); err != nil {
 //	            return
 //	        }
+//	        lastRev = rev
 //	    }
 //	}
 //
-// 完整模板（含心跳收尾、应用停机、错误分界）见 README 第 9 节。
+// lastRev 必须随成功发送推进：只与快照比较挡不住快照之后乱序到达的回退版本
+// （Hub 不保证跨并发推送方的到达顺序，先到 rev 10、后到 rev 9 时 9 也会被转发，
+// 前端状态回退）。
+//
+// 完整模板（含心跳收尾、应用停机、错误分界、租户作用域 key）见 README 第 9 节。
 func (h *Hub) Subscribe(key string) (events <-chan Event, release func()) {
 	sub := &subscriber{ch: make(chan Event, h.queueSize)}
 
@@ -141,8 +166,16 @@ func (h *Hub) Subscribe(key string) (events <-chan Event, release func()) {
 	return sub.ch, func() { h.unsubscribe(key, sub) }
 }
 
-// Push 把 e 投给 key 下所有在线连接，返回投递成功的连接数与被挤掉的旧事件数。
+// Push 把 e 投给 key 下所有在线连接，返回入队成功的连接数与被挤掉的旧事件数。
 // key 不在线时返回 (0, 0)，不报错、不阻塞。
+//
+// delivered 不是交付确认：它只表示事件进入了多少个**本机内存队列**，不代表
+// 客户端收到、Flush 成功、浏览器处理完成、其他实例上的连接收到、连接没有随即
+// 断开，也不代表这条事件没有被后续溢出挤掉。因此 delivered 与 dropped 只用于
+// 监控，MUST NOT 用来判断业务是否成功、或决定要不要持久化。
+//
+// 正确顺序是：在事务里写入状态与单调递增 revision → 提交成功 → 再 Push。
+// 反过来（先 Push、delivered == 0 才落库）会在事件丢失时同时丢掉状态。
 //
 // 目标队列已满时挤掉该连接队首最旧的一条，让 e 一定入队（latest-wins），
 // 既不阻塞也不重试：状态推送里最新一条描述的就是当前状态，必须送达；

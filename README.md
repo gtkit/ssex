@@ -408,28 +408,37 @@ for msg, err := range ssex.Decode(resp.Body) {
 hub := ssex.NewHub()                        // 无后台 goroutine，不需要关闭
 
 // 推送方（支付回调、MQ 消费者……）
-delivered, dropped := hub.Push(uid, ssex.Event{Name: "status", Data: order})
-if delivered == 0 {
-    // 没人在线，落库让客户端下次拉快照
-}
+// 顺序不能反：先在事务里持久化状态与 revision、提交成功，再发布事件。
+delivered, dropped := hub.Push(uid, ssex.Event{ID: rev, Name: "status", Data: order})
+metrics.Observe(delivered, dropped) // 只做监控，不参与任何业务判断
 ```
+
+**`delivered` 不是交付确认。** 它只表示事件成功进入了多少个**本机内存队列**，不代表客户端收到、`Flush` 成功、浏览器处理完成、其他实例上的连接收到、连接没有随即断开，也不代表这条事件没有被后续溢出挤掉。因此绝不能写成"`delivered == 0` 才落库"——状态必须先持久化再发布，`delivered` / `dropped` 只用于监控。
 
 连接侧的 handler 模板：
 
 ```go
 func Subscribe(c *gin.Context) {
+    // key 必须由服务端身份计算，且非空：空 key 会让所有认证异常的请求
+    // 共享同一个队列、互相收到对方的事件（见 4.15）。
     uid := c.GetString("uid")
-    stream := ssex.NewStream(c.Writer, c.Request)
-
-    // 必须先起流：纯推送型 handler 在第一条事件到来前不写字节，
-    // 不起流则前端一直等响应头、迟迟不触发 onopen。
-    // 起流失败说明连接已不可用，此时响应头尚未提交，还能回普通 JSON。
-    if err := stream.Start(); err != nil {
+    if uid == "" {
+        c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
         return
     }
 
+    // 先订阅、再起流：Start 最坏要等一个完整的 WithWriteTimeout，
+    // 这段时间里的推送若无人订阅就永久丢失。
     events, release := hub.Subscribe(uid)
     defer release()
+
+    stream := ssex.NewStream(c.Writer, c.Request)
+
+    // 纯推送型 handler 在第一条事件到来前不写字节，不起流则前端一直等响应头、
+    // 迟迟不触发 onopen。起流失败时响应头尚未提交，还能回普通 JSON。
+    if err := stream.Start(); err != nil {
+        return
+    }
 
     // 心跳错误要能被主循环看到：慢客户端会让心跳返回 ErrWriteTimeout，
     // 而此时请求上下文可能还没结束，只丢弃错误会让 handler 继续空等。
@@ -488,6 +497,33 @@ func Subscribe(c *gin.Context) {
 7. **适用边界**：Hub 面向**状态推送**——每条事件自带完整状态，丢掉中间过程无妨。AI token 流每一条都是文本的一部分，少一条就损坏输出，应在 handler 内直接用 `stream.Data` 写出，不经 Hub。
 
 消费循环用 `stream.Context().Done()` 退出，队列由 GC 回收。
+
+### 4.15 Hub 的两条硬边界
+
+**一、Hub 只管当前进程的连接。** 多实例部署时，连接在实例 A、支付回调打到实例 B，实例 B 的 `Push` 找不到那条连接，返回 `delivered == 0`，前端收不到更新；`Online` 也只反映本机而非集群。滚动发布、负载均衡、`EventSource` 重连换实例都会触发。
+
+单实例可以直接用。多实例必须让**每个实例都收到状态事件**，再各自推给本地 Hub：
+
+```text
+数据库事务：写状态 + 单调递增 revision
+        ↓ 提交成功
+Outbox / MQ / Redis Pub/Sub
+        ↓ 广播式消费（每个实例都收到）
+各实例 hub.Push(key, event)
+        ↓
+本实例上的连接收到状态
+```
+
+也可以用一致性哈希把同一 key 的连接与事件路由到同一实例，但运维复杂度更高。无论哪种，**存储始终是事实源**，Hub 只是加速通道。
+
+AI 对话流在 handler 内直连上游、不经 Hub，因此不受这条限制。
+
+**二、key 必须是服务端计算出的安全作用域。** Hub 的 key 就是一个字符串，两个不同租户的 `orderID=100` 会落进同一个 key，造成跨租户状态串流。约束：
+
+- key 只能由**已认证身份 + 已授权资源**计算，不能直接用 URL、query 或客户端传入的值
+- 多租户必须带 tenant 作用域，如 `tenantID:userID:orderID`，或用服务端生成的全局唯一不可猜测 ID
+- **禁止空 key**：空 key 会让所有认证异常的请求共享同一个队列、互相收到对方的事件
+- `Broadcast` 只用于确实允许所有在线用户看到的内容
 
 ## 5. 常见模式
 
@@ -550,7 +586,7 @@ _ = stream.Close(gin.H{"reason": "done"})
 - 快照先发：客户端可能在状态变更之后才连上来
 - 心跳必须有：等支付的连接可能几分钟没有数据
 - 终态后 `Close`，否则 `EventSource` 会一直重连
-- `Push` 返回 `delivered == 0` 说明没人在等，把状态落库即可
+- 状态先持久化再发布事件；`delivered == 0` 只说明本机此刻没有在等的连接，不能用它决定是否落库（见 4.14）
 
 ## 6. 推荐实践
 
@@ -752,22 +788,32 @@ gin 的 `c.Writer` 是 `Context` 的内部字段（`c.Writer = &c.writermem`）�
 
 ```go
 func OrderEvents(c *gin.Context) {
-    // 1. 鉴权与参数校验：必须全部在 Start() 之前完成，
-    //    此时还没有提交响应头，可以正常返回 JSON 错误。
-    uid := c.GetString("uid") // 由鉴权中间件写入
-    if uid == "" {
+    // 1. 认证：必须在 Start() 之前，此时还没提交响应头，可以正常返回 JSON 错误。
+    uid, tenantID := c.GetString("uid"), c.GetString("tenant") // 由鉴权中间件写入
+    if uid == "" || tenantID == "" {
         c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
         return
     }
     orderID := c.Param("id")
 
-    // 2. 先订阅，再读快照。顺序反过来会永久漏事件：Load 与 Subscribe 之间发生的
+    // 2. 资源授权：与"读快照"分开做。授权是廉价的归属检查，先做掉可以避免
+    //    产生未授权订阅（会让 Online 出现伪在线）。
+    if err := svc.Authorize(c.Request.Context(), tenantID, uid, orderID); err != nil {
+        c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "无权访问"})
+        return
+    }
+
+    // 3. key 由服务端身份与已授权资源计算，带租户作用域——直接用 orderID 会让
+    //    不同租户的同名 ID 落进同一个 key，造成跨租户串流（见 4.15）。
+    key := tenantID + ":" + orderID
+
+    // 4. 先订阅，再读快照。顺序反过来会永久漏事件：Load 与 Subscribe 之间发生的
     //    状态变更此时无人订阅，推送直接丢弃，客户端会永远停在旧快照上（见 6.7）。
-    events, release := hub.Subscribe(orderID)
+    events, release := hub.Subscribe(key)
     defer release()
 
-    // 3. 从持久化事实源读快照。失败时还没起流，可以回普通 JSON。
-    snapRev, snapshot, err := svc.Load(c.Request.Context(), orderID, uid)
+    // 5. 从持久化事实源读快照。失败时还没起流，可以回普通 JSON。
+    snapRev, snapshot, err := svc.Load(c.Request.Context(), orderID)
     if err != nil {
         c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "订单不存在"})
         return
@@ -775,19 +821,19 @@ func OrderEvents(c *gin.Context) {
 
     stream := ssex.NewStream(c.Writer, c.Request, ssex.WithWriteTimeout(10*time.Second))
 
-    // 4. 起流：失败时响应头尚未提交，仍可回 JSON。
+    // 6. 起流：失败时响应头尚未提交，仍可回 JSON。
     if err := stream.Start(); err != nil {
         handleStreamError(c, stream, err)
         return
     }
 
-    // 5. 发快照，revision 放进事件 id。
+    // 7. 发快照，revision 放进事件 id。
     if err := stream.EventWithID(strconv.FormatInt(snapRev, 10), "status", snapshot); err != nil {
         handleStreamError(c, stream, err)
         return
     }
 
-    // 6. 心跳：错误走 hbErr、"已退出"走 hbDone，并在 handler 返回前等它退出（见 4.12、9.1）。
+    // 8. 心跳：错误走 hbErr、"已退出"走 hbDone，并在 handler 返回前等它退出（见 4.12、9.1）。
     hbCtx, stopHeartbeat := context.WithCancel(c.Request.Context())
     hbErr := make(chan error, 1)
     hbDone := make(chan struct{})
@@ -802,7 +848,7 @@ func OrderEvents(c *gin.Context) {
         <-hbDone
     }()
 
-    // 7. 事件循环：四个退出口。lastRev 从快照起步并随成功发送推进——
+    // 9. 事件循环：四个退出口。lastRev 从快照起步并随成功发送推进——
     //    只比快照不够：Hub 不保证跨推送方的到达顺序，快照之后仍可能先到 rev 10、
     //    后到 rev 9，只比快照会把 9 也转发出去，前端状态回退。
     lastRev := snapRev
@@ -824,7 +870,14 @@ func OrderEvents(c *gin.Context) {
             if !ok {
                 // 生产者没填 revision：告警而不是静默丢弃。若把解析失败当成 0，
                 // 事件会因为 0 <= lastRev 被默默吃掉，排查时只看到"前端收不到状态"。
-                logger.Warn("事件缺少 revision", zap.Any("event", e))
+                // 只记可定位的元数据：Event.Data 可能含身份信息、token、
+                // 订单详情或 AI 对话内容，不要整个序列化进日志。
+                logger.Warn("事件缺少 revision",
+                    zap.String("key", maskKey(key)),
+                    zap.String("event_id", e.ID),
+                    zap.String("event_name", e.Name),
+                    zap.String("payload_type", fmt.Sprintf("%T", e.Data)),
+                    zap.String("trace_id", traceID(c)))
                 continue
             }
             if rev <= lastRev {
@@ -885,6 +938,8 @@ func handleStreamError(c *gin.Context, stream *ssex.Stream, err error) {
 错误分级：`ErrClientGone` 与 `context.Canceled` 属正常收尾，调试级记录；`ErrWriteTimeout`、序列化错误与未知写错误需要告警。
 
 返回什么状态码与响应体是业务策略，因此库只提供 `Started()` 这个分界信号，不封装响应内容。
+
+**日志不要序列化整个 `Event.Data` 或响应载荷。** 它可能含身份信息、登录 token、订单详情、AI 对话内容、手机号或地址。只记可定位的元数据：key 的脱敏值、`Event.ID`、`Event.Name`、载荷类型、Trace ID、错误原因。
 
 ### 9.4 中间件兼容
 

@@ -215,3 +215,64 @@ func TestInvalidRevisionIsReportedNotSilentlyDropped(t *testing.T) {
 		t.Fatal("缺少 revision 的事件被静默丢弃，未上报")
 	}
 }
+
+// TestEmptyKeyIsRejectedBeforeSubscribe 验证认证异常的请求不会进入 Hub。
+//
+// 回归场景：简版模板曾读取 uid 但不检查空串。空 key 会让所有认证异常的请求
+// 共享同一个队列、互相收到对方的事件——这是跨用户串流。
+// 模板必须在 Subscribe 之前拒掉空 key。
+func TestEmptyKeyIsRejectedBeforeSubscribe(t *testing.T) {
+	t.Parallel()
+
+	hub := ssex.NewHub()
+	deps := orderEventsDeps{hub: hub, appShutdown: context.Background()}
+	server := httptest.NewServer(newEngine(deps, "")) // 中间件不注入 uid
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/events/orders/o1")
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+
+	// 关键：空 key 不得进入注册表
+	if got := hub.Online(""); got != 0 {
+		t.Fatalf(`Online("") = %d, want 0（空 key 进了 Hub，认证异常的请求会互相串流）`, got)
+	}
+	if got := hub.Online("o1"); got != 0 {
+		t.Fatalf(`Online("o1") = %d, want 0`, got)
+	}
+}
+
+// TestKeyScopeIsolatesTenants 验证带租户作用域的 key 不会跨租户串流。
+//
+// 直接用 orderID 作为 key 时，两个租户的 orderID=100 会落进同一个 key。
+func TestKeyScopeIsolatesTenants(t *testing.T) {
+	t.Parallel()
+
+	hub := ssex.NewHub(ssex.WithQueueSize(4))
+
+	tenantA, releaseA := hub.Subscribe("tenantA:100")
+	defer releaseA()
+	tenantB, releaseB := hub.Subscribe("tenantB:100")
+	defer releaseB()
+
+	if delivered, _ := hub.Push("tenantA:100", ssex.Event{ID: "1", Name: "status"}); delivered != 1 {
+		t.Fatalf("Push delivered = %d, want 1", delivered)
+	}
+
+	select {
+	case <-tenantA:
+	default:
+		t.Fatal("租户 A 未收到自己的事件")
+	}
+	select {
+	case e := <-tenantB:
+		t.Fatalf("租户 B 收到了租户 A 的事件: %+v", e)
+	default:
+	}
+}

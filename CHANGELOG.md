@@ -12,6 +12,11 @@
 - README 新增「Gin 集成」一节：完整 handler 模板（鉴权 → 起流错误 → 先订阅后快照 → 心跳收尾 → 四出口事件循环）、以 `Started()` 分界的错误处理规范与错误分级、中间件兼容清单与路由组隔离、`c.Writer` 生命周期约束。
 
 ### Fixed
+- ⚠ 修复简版 Hub handler 模板仍是"先 `Start` 后 `Subscribe`"：`Start` 最坏要等一个完整的 `WithWriteTimeout`，这段时间里的推送无人订阅、永久丢失。已改为先订阅再起流。
+- ⚠ 修复简版模板读取 `uid` 但不检查空串：空 key 会让所有认证异常的请求共享同一个队列、互相收到对方的事件。模板改为在 `Subscribe` 之前拒掉空 key，并新增回归测试断言空 key 不进入注册表。
+- ⚠ 修正 README 把 `delivered == 0` 当作"是否落库"判据的危险示例：`delivered` 只表示入队的本机连接数，不代表客户端收到、`Flush` 成功、其他实例的连接收到，也不代表事件没被后续溢出挤掉。已改为"先在事务里持久化状态与 revision、提交成功、再发布事件"，`delivered` / `dropped` 只用于监控。该表述此前与 6.7 的"存储是唯一事实源"直接矛盾。
+- 修复 `Hub.Subscribe` 的 GoDoc 示例仍是只与快照比较的旧过滤方式（漏改，而 GoDoc 直接出现在 IDE 与 pkg.go.dev）：改为维护 `lastRev`、处理 revision 解析失败，并补上入队不等于交付、key 需带租户作用域、Hub 仅限当前进程三条说明。
+- 修正 README 9.2 把整个 `Event` 写进日志的示例：`Event.Data` 可能含身份信息、登录 token、订单详情或 AI 对话内容。改为只记 key 脱敏值、`Event.ID` / `Event.Name`、载荷类型与 Trace ID。
 
 - ⚠ 修复 `Stream.Heartbeat` 的 GoDoc 示例仍是会死锁的旧范式：README 与 gin 模板已修正，但公共 API 的 GoDoc 漏改，而它会直接出现在 IDE 与 pkg.go.dev，比 README 更容易被原样复制。
 - ⚠ 修复文档模板的 revision 过滤只与快照比较：`revision <= snapRev` 能挡住订阅到读快照之间积压的旧事件，但挡不住快照之后乱序到达的回退版本（Hub 不保证跨并发推送方的到达顺序，先到 rev 10、后到 rev 9 时 9 也会被转发，前端状态回退）。模板改为维护随成功发送推进的 `lastRev`。
@@ -28,6 +33,8 @@
 - 修正 README 的心跳模板：原写法只发停止信号、不等 goroutine 退出。gin 的 `c.Writer` 是 `Context` 的内部字段，handler 返回后 `Context` 归还对象池并在下个请求中被重置，因此心跳 goroutine 若在 handler 返回后仍在写入，就会写到另一个请求的响应上。模板改为独立 ctx + `defer stop(); <-hbDone` 等待退出。
 
 ### Changed
+- `Hub` 的 GoDoc 与 README 新增两条硬边界：**Hub 只管当前进程的连接**（多实例部署时连接在实例 A、回调打到实例 B 会导致 `Push` 找不到连接，需要每个实例都收到状态事件后各自推本地 Hub，或用一致性哈希路由；存储始终是事实源），以及 **key 必须是服务端计算的安全作用域**（两个租户的同名 ID 会落进同一 key 造成跨租户串流，禁止空 key，`Broadcast` 只用于全员可见内容）。
+- README 9.2 模板把资源授权与读取快照拆开：授权先做可避免产生未授权订阅（会让 `Online` 出现伪在线）；key 改用 `tenantID:orderID` 形态。
 
 - `Stream` 与 `Stream.Heartbeat` 的 GoDoc 补写生命周期约束：底层 `http.ResponseWriter` 只在 handler 执行期间有效，在 handler goroutine 之外写入的 goroutine 必须在 handler 返回前退出；`c.Copy()` 的副本只能读请求元数据（gin 会把副本的 `ResponseWriter` 置为 nil），不能用于写响应。
 - `Event.Data` 补充所有权约束：投递给 `Hub.Push` / `Hub.Broadcast` 后即视为交出所有权，同一份载荷会被多个连接在各自 goroutine 里序列化，投递后修改其中的 map / 切片 / 指针会构成数据竞争。
