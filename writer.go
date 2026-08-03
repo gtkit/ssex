@@ -115,7 +115,7 @@ func (w *Writer) commitHeaders() error {
 	//
 	// 这次刷新与后续帧共用 per-write deadline：刚才清零的是连接级截止时间，
 	// 若这里不设上界，异常或恶意连接能让 handler 无限期卡在起流上。
-	return w.withWriteDeadline(func() error {
+	return w.withWriteDeadline(opStart, func() error {
 		return w.flush(opStart)
 	})
 }
@@ -269,7 +269,7 @@ func (w *Writer) emit(op, frame string) error {
 		return err
 	}
 
-	return w.withWriteDeadline(func() error {
+	return w.withWriteDeadline(op, func() error {
 		if _, err := io.WriteString(w.w, frame); err != nil {
 			return classify(w.r.Context(), op, err)
 		}
@@ -328,17 +328,20 @@ func (w *Writer) flush(op string) error {
 	return nil
 }
 
-func (w *Writer) withWriteDeadline(fn func() error) error {
+func (w *Writer) withWriteDeadline(op string, fn func() error) error {
 	rc := http.NewResponseController(w.w)
 	if err := rc.SetWriteDeadline(time.Now().Add(w.writeTimeout)); err != nil {
 		if !errors.Is(err, http.ErrNotSupported) {
-			return fmt.Errorf("ssex: set write deadline: %w", err)
+			// 与 clearWriteDeadline 统一走 classify:checkAlive 通过之后客户端可能
+			// 刚好断开,此时拿到的是连接已关闭错误,应判定为 ErrClientGone,
+			// 否则调用方会把一次正常断线记成生产告警。
+			return classify(w.r.Context(), op, err)
 		}
 
 		return fn()
 	}
-	// 恢复失败不额外上报:那意味着后续帧仍带这次已过期的截止时间,
-	// 下一次写入会立即失败并返回 ErrWriteTimeout——是延后一帧暴露,而非静默丢失。
+	// 恢复失败不额外上报:连接上会留下一个已过期的截止时间,但下一次写入会先设置
+	// 新的截止时间把它覆盖掉,因此不影响后续帧;若那次设置同样失败,错误会在当次返回。
 	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
 
 	return fn()

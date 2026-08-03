@@ -8,6 +8,12 @@
 
 ### Fixed
 
+- ⚠ 修复文档模板会让 handler 永久阻塞的缺陷：心跳模板原先用同一个 channel 既传错误、又当"goroutine 已退出"信号。心跳 goroutine 只发送一次结果，主循环消费掉之后，`defer` 里的第二次接收永远等不到发送者。后果不止泄漏一个 goroutine——`defer release()` 按 LIFO 排在阻塞的 defer 之后，因此 Hub 注册表不清理、`Online` 长期不准、`http.Server.Shutdown` 一直等、gin `Context` 无法归还对象池。现改为错误走 `hbErr`、退出走 `close(hbDone)`，两个信号分离。已由确定性复现测试守住（修复前卡到超时，修复后 0.04s 通过）。
+- ⚠ 修复文档模板的订阅顺序：README 9.2 原先是 `Load → Start → Subscribe`，与 6.7 自述的"先订阅、后取快照"矛盾。`Load` 与 `Subscribe` 之间发生的状态变更此时无人订阅、推送被直接丢弃，客户端拿到旧快照后再也收不到更新——正好命中订单支付与登录态场景。现改为 `Subscribe → 读快照 → Start → 发快照`，并在消费循环中跳过 revision 不大于快照的积压事件。新增两个测试覆盖"读快照期间发生变更"与"积压旧事件被过滤"。
+- 修复 README 4.12 仍保留的不安全心跳示例（丢弃错误、不等待 goroutine 退出）。
+- 修复 `hub.go` 中 `Subscribe` 的 GoDoc 示例：仍在用解耦前的 `ssex.NewStream(c)` 签名且忽略 `Start()` 返回值。GoDoc 会直接出现在 IDE 与 pkg.go.dev。
+- 设置逐帧写截止时间失败时统一走错误分类：此前直接包装返回普通错误，连接检查通过后客户端立即断开的窗口里，一次正常断线会被记成生产告警。
+- 修正 `withWriteDeadline` 中恢复截止时间失败的注释：原注释称"下一次写入会立即失败并返回 `ErrWriteTimeout`"，实际上下一次写入会先设置新的截止时间覆盖过期值。
 - 起流的响应头刷新纳入 per-write 写截止时间（`WithWriteTimeout`）。此前 `WriteHeaders` 先清除 `http.Server.WriteTimeout`、随后直接刷新，而逐帧截止时间只作用于后续帧，异常或恶意连接可以让 handler 无上界地卡在起流上。
 - 解除 `http.Server.WriteTimeout` 失败时不再静默继续：除 `http.ErrNotSupported`（底层不支持，降级）外一律返回错误，且此时响应头尚未提交、`Started()` 保持 false，调用方仍可改回普通 JSON。吞掉这个错误等于谎称长连接已保活，而连接其实仍会在全局写超时到期时被服务端中断。
 - `Option` 与 `HubOption` 跳过 nil，不再因调用方传入零值 Option 而 panic。

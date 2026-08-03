@@ -343,10 +343,28 @@ stream := ssex.NewStream(c.Writer, c.Request, ssex.WithWriteTimeout(30*time.Seco
 长时间无数据的流（等支付结果、等登录态）必须有心跳，否则代理层会按空闲连接断开。
 
 ```go
-go func() { _ = stream.Heartbeat(c.Request.Context(), 15*time.Second) }()
+// 错误结果走 hbErr，"已退出"走 hbDone——两者必须分开，理由见下
+hbCtx, stopHeartbeat := context.WithCancel(c.Request.Context())
+hbErr := make(chan error, 1)
+hbDone := make(chan struct{})
+go func() {
+    defer close(hbDone)
+    if err := stream.Heartbeat(hbCtx, 15*time.Second); err != nil {
+        hbErr <- err
+    }
+}()
+defer func() {
+    stopHeartbeat()
+    <-hbDone // 等它真的退出，再让 handler 返回
+}()
 ```
 
 阻塞运行，启动时机与所在 goroutine 由你控制。`ctx` 取消返回 `ctx` 错误，客户端断开返回 `ErrClientGone`，流已 `Close` 返回 `ErrStreamClosed`；`interval` 非正立即报错。
+
+两条约束都不能省：
+
+- **必须等它退出**：底层 `ResponseWriter` 只在 handler 执行期间有效（gin 会池化复用，见 9.1）。handler 返回后心跳若还在写，就写到别人的响应上了。
+- **错误信号与退出信号必须分开**：若用同一个 channel 兼任，主循环消费掉唯一那次发送后，`defer` 里的第二次接收就永远等不到发送者——handler 永久阻塞，连排在后面的 `release()` 都不会执行。`hbDone` 用 `close`，读多少次都不会阻塞。
 
 ### 4.13 `ssex.Decode(r)` — 解析上游 SSE
 
@@ -416,15 +434,20 @@ func Subscribe(c *gin.Context) {
     // 心跳错误要能被主循环看到：慢客户端会让心跳返回 ErrWriteTimeout，
     // 而此时请求上下文可能还没结束，只丢弃错误会让 handler 继续空等。
     //
-    // 用独立 ctx 并在 defer 里等它退出：c.Writer 是 gin Context 的内部字段，
-    // handler 一返回就会被归还对象池、并在下个请求里指向另一个响应。
-    // 心跳 goroutine 必须在 handler 返回前结束，否则会写到别人的响应上。
+    // 错误走 hbErr，"已退出"走 hbDone，两者必须分开（见 4.12）；
+    // 并且必须等它退出——c.Writer 会被 gin 池化复用（见 9.1）。
     hbCtx, stopHeartbeat := context.WithCancel(c.Request.Context())
     hbErr := make(chan error, 1)
-    go func() { hbErr <- stream.Heartbeat(hbCtx, 15*time.Second) }()
+    hbDone := make(chan struct{})
+    go func() {
+        defer close(hbDone)
+        if err := stream.Heartbeat(hbCtx, 15*time.Second); err != nil {
+            hbErr <- err
+        }
+    }()
     defer func() {
         stopHeartbeat()
-        <-hbErr
+        <-hbDone
     }()
 
     for {
@@ -736,7 +759,14 @@ func OrderEvents(c *gin.Context) {
         return
     }
     orderID := c.Param("id")
-    snapshot, err := svc.Load(c.Request.Context(), orderID, uid)
+
+    // 2. 先订阅，再读快照。顺序反过来会永久漏事件：Load 与 Subscribe 之间发生的
+    //    状态变更此时无人订阅，推送直接丢弃，客户端会永远停在旧快照上（见 6.7）。
+    events, release := hub.Subscribe(orderID)
+    defer release()
+
+    // 3. 从持久化事实源读快照。失败时还没起流，可以回普通 JSON。
+    snapRev, snapshot, err := svc.Load(c.Request.Context(), orderID, uid)
     if err != nil {
         c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "订单不存在"})
         return
@@ -744,31 +774,34 @@ func OrderEvents(c *gin.Context) {
 
     stream := ssex.NewStream(c.Writer, c.Request, ssex.WithWriteTimeout(10*time.Second))
 
-    // 2. 起流：失败时响应头尚未提交，仍可回 JSON。
+    // 4. 起流：失败时响应头尚未提交，仍可回 JSON。
     if err := stream.Start(); err != nil {
         handleStreamError(c, stream, err)
         return
     }
 
-    // 3. 先订阅、后发快照，避免漏掉两步之间的变更（见 6.7）。
-    events, release := hub.Subscribe(orderID)
-    defer release()
-
-    if err := stream.EventWithID(revID(snapshot), "status", snapshot); err != nil {
+    // 5. 发快照，revision 放进事件 id。
+    if err := stream.EventWithID(strconv.FormatInt(snapRev, 10), "status", snapshot); err != nil {
         handleStreamError(c, stream, err)
         return
     }
 
-    // 4. 心跳：独立 ctx，并在 handler 返回前等它退出（见 9.1）。
+    // 6. 心跳：错误走 hbErr、"已退出"走 hbDone，并在 handler 返回前等它退出（见 4.12、9.1）。
     hbCtx, stopHeartbeat := context.WithCancel(c.Request.Context())
     hbErr := make(chan error, 1)
-    go func() { hbErr <- stream.Heartbeat(hbCtx, 15*time.Second) }()
+    hbDone := make(chan struct{})
+    go func() {
+        defer close(hbDone)
+        if err := stream.Heartbeat(hbCtx, 15*time.Second); err != nil {
+            hbErr <- err
+        }
+    }()
     defer func() {
         stopHeartbeat()
-        <-hbErr
+        <-hbDone
     }()
 
-    // 5. 事件循环：四个退出口。
+    // 7. 事件循环：四个退出口。
     for {
         select {
         case <-appShutdown.Done(): // 应用停机（见 6.9）
@@ -783,6 +816,11 @@ func OrderEvents(c *gin.Context) {
             return
 
         case e := <-events:
+            // 跳过不比快照新的事件：订阅到读快照之间积压的那些，快照里已经含了，
+            // 直接转发会让前端出现状态回退。
+            if revisionOf(e) <= snapRev {
+                continue
+            }
             if err := stream.Send(e); err != nil {
                 handleStreamError(c, stream, err)
                 return
@@ -795,6 +833,8 @@ func OrderEvents(c *gin.Context) {
     }
 }
 ```
+
+这段模板的可执行版本在 [gincompat/handler_test.go](./gincompat/handler_test.go)——模板改了那里会挂，文档不会悄悄失真。
 
 ### 9.3 错误处理规范
 

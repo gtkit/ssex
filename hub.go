@@ -88,21 +88,39 @@ func NewHub(opts ...HubOption) *Hub {
 // 关闭它会与并发的 Push 构成"向已关闭 channel 发送"的 panic 竞态。
 // 用连接上下文结束消费循环：
 //
-//	stream := ssex.NewStream(c)
-//	stream.Start() // 必须先起流:否则响应头要等到第一条推送才发出,前端迟迟不触发 onopen
-//
 //	events, release := hub.Subscribe(uid)
 //	defer release()
+//
+//	// 订阅之后再读快照,否则两步之间的状态变更无人接收、会永久丢失
+//	snapRev, snapshot, err := svc.Load(r.Context(), uid)
+//	if err != nil {
+//	    // 尚未起流,这里还能回普通 JSON
+//	    return
+//	}
+//
+//	stream := ssex.NewStream(w, r) // gin 里传 c.Writer, c.Request
+//	if err := stream.Start(); err != nil {
+//	    return // 必须先起流,否则响应头要等到第一条推送才发出,前端迟迟不触发 onopen
+//	}
+//	if err := stream.EventWithID(strconv.FormatInt(snapRev, 10), "status", snapshot); err != nil {
+//	    return
+//	}
+//
 //	for {
 //	    select {
 //	    case <-stream.Context().Done():
 //	        return
 //	    case e := <-events:
+//	        if revisionOf(e) <= snapRev { // 快照里已经含了的旧事件,跳过
+//	            continue
+//	        }
 //	        if err := stream.Send(e); err != nil {
 //	            return
 //	        }
 //	    }
 //	}
+//
+// 完整模板（含心跳收尾、应用停机、错误分界）见 README 第 9 节。
 func (h *Hub) Subscribe(key string) (events <-chan Event, release func()) {
 	sub := &subscriber{ch: make(chan Event, h.queueSize)}
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -24,10 +25,23 @@ func init() {
 type orderEventsDeps struct {
 	hub         *ssex.Hub
 	appShutdown context.Context
+	// load 从持久化事实源读快照，返回单调递增的 revision 与载荷。
+	// 为 nil 时用一个固定的 pending 快照。
+	load func(ctx context.Context, orderID string) (int64, gin.H, error)
 	// onStreamError 记录 handler 观察到的错误，供断言。
 	onStreamError func(started bool, err error)
 	// terminal 判断某条事件是否终态。
 	terminal func(ssex.Event) bool
+}
+
+// revisionOf 取事件携带的 revision（模板约定放在 Event.ID 里）。
+func revisionOf(e ssex.Event) int64 {
+	rev, err := strconv.ParseInt(e.ID, 10, 64)
+	if err != nil {
+		return 0
+	}
+
+	return rev
 }
 
 // orderEvents 是 README 9.2 的模板 handler。
@@ -42,35 +56,60 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 		}
 		orderID := c.Param("id")
 
+		// 2. 先订阅，再读快照。顺序反过来会永久漏事件：Load 与 Subscribe 之间
+		//    发生的状态变更此时无人订阅，推送直接丢弃，客户端会永远停在旧快照上。
+		events, release := deps.hub.Subscribe(orderID)
+		defer release()
+
+		// 3. 从事实源读快照。失败时还没起流，可以回普通 JSON。
+		load := deps.load
+		if load == nil {
+			load = func(context.Context, string) (int64, gin.H, error) {
+				return 1, gin.H{"status": "pending"}, nil
+			}
+		}
+		snapRev, snapshot, err := load(c.Request.Context(), orderID)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "订单不存在"})
+
+			return
+		}
+
 		stream := ssex.NewStream(c.Writer, c.Request, ssex.WithWriteTimeout(10*time.Second))
 
-		// 2. 起流失败时响应头尚未提交，仍可回 JSON
+		// 4. 起流失败时响应头尚未提交，仍可回 JSON
 		if err := stream.Start(); err != nil {
 			handleStreamError(c, stream, deps, err)
 
 			return
 		}
 
-		// 3. 先订阅、后发快照
-		events, release := deps.hub.Subscribe(orderID)
-		defer release()
-
-		if err := stream.EventWithID("1", "status", gin.H{"status": "pending"}); err != nil {
+		// 5. 发快照，revision 放进事件 id
+		if err := stream.EventWithID(strconv.FormatInt(snapRev, 10), "status", snapshot); err != nil {
 			handleStreamError(c, stream, deps, err)
 
 			return
 		}
 
-		// 4. 心跳：独立 ctx，并在 handler 返回前等它退出
+		// 6. 心跳：独立 ctx；错误走 hbErr，"已退出"走 hbDone。
+		//    两者必须分开：若用同一个 channel 兼任，主循环的 case 消费掉唯一那次
+		//    发送后，defer 里的第二次接收就永远等不到发送者——handler 永久阻塞，
+		//    连排在后面的 release() 都不会执行。hbDone 用 close，读多少次都不会阻塞。
 		hbCtx, stopHeartbeat := context.WithCancel(c.Request.Context())
 		hbErr := make(chan error, 1)
-		go func() { hbErr <- stream.Heartbeat(hbCtx, 20*time.Millisecond) }()
+		hbDone := make(chan struct{})
+		go func() {
+			defer close(hbDone)
+			if err := stream.Heartbeat(hbCtx, 20*time.Millisecond); err != nil {
+				hbErr <- err
+			}
+		}()
 		defer func() {
 			stopHeartbeat()
-			<-hbErr
+			<-hbDone
 		}()
 
-		// 5. 四个退出口
+		// 7. 四个退出口
 		for {
 			select {
 			case <-deps.appShutdown.Done():
@@ -87,6 +126,10 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 				return
 
 			case e := <-events:
+				// 跳过不比快照新的事件：订阅到读快照之间积压的那些，快照里已经含了
+				if revisionOf(e) <= snapRev {
+					continue
+				}
 				if err := stream.Send(e); err != nil {
 					handleStreamError(c, stream, deps, err)
 
