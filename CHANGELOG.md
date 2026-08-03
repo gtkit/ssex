@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [v0.2.2] - 2026-08-03
+
 ### Fixed
 
 - 大模型转发模板（README 5.1）现在有可执行版本 `gincompat/relay_test.go`：模板此前只存在于 Markdown 里，已经反复出现过回归（遮蔽心跳错误、Transport 丢默认值、把截断当完成、缺显式起流）。现在用 `httptest` 假上游跑完整 handler，覆盖结束哨兵有/无、`Content-Type` 精确校验、校验通过即起流、长空闲期心跳保活、下游断开取消上游——模板改坏了测试会挂。
