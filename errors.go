@@ -22,7 +22,10 @@ var ErrClientGone = errors.New("ssex: client gone")
 var ErrStreamClosed = errors.New("ssex: stream closed")
 
 // ErrInvalidArgument 表示调用方传入了非法参数：字段值含换行或 NUL、retry 为负、
-// 心跳间隔非正等。这类错误是编程错误，且发生在提交响应头之前，调用方仍可改回普通 JSON 响应。
+// 心跳间隔非正等。这类错误在帧构造阶段就返回，不写出任何字节。
+//
+// 若它发生在**首帧**（流尚未开始，Started() 为 false），响应头还没提交，
+// 调用方可以改用普通 JSON 响应回错；流已开始之后出现的这类错误只表示该帧被拒绝。
 var ErrInvalidArgument = errors.New("ssex: invalid argument")
 
 // ErrWriteTimeout 表示单帧写入超过了写截止时间（见 WithWriteTimeout），

@@ -67,21 +67,37 @@ func (w *Writer) WriteHeaders() error {
 	if err := w.checkAlive(opStart); err != nil {
 		return err
 	}
+	if err := w.clearWriteDeadline(); err != nil {
+		return err
+	}
 
-	return w.writeHeaders()
+	return w.commitHeaders()
 }
 
-// writeHeaders 提交响应头并刷出,不检查连接状态。
-// 与 WriteHeaders 分开是为了让 Stream 能区分"响应头未提交"（连接已断开）
-// 与"响应头已提交但刷新失败"这两种情况——后者不能再提交第二次。
-func (w *Writer) writeHeaders() error {
-	// SSE 是长连接：必须解除 http.Server.WriteTimeout 对本条连接的写截止时间，
-	// 否则待支付订单、LLM 长响应会在全局 WriteTimeout 到期时被服务端 RST。
-	// SetWriteDeadline(time.Time{}) 表示不设超时；失败（httptest 的
-	// http.ErrNotSupported / 连接已半关）不影响响应头继续下发，让后续 Write 自然报错。
-	rc := http.NewResponseController(w.w)
-	_ = rc.SetWriteDeadline(time.Time{})
+// clearWriteDeadline 解除 http.Server.WriteTimeout 对本条长连接的写截止时间。
+//
+// SSE 是长连接：不解除的话，待支付订单、大模型长响应会在全局 WriteTimeout
+// 到期时被服务端 RST。因此这里的失败不能吞掉——吞掉就等于对调用方谎称
+// "长连接已保活"，而连接其实仍会在几十秒后被掐断。
+// 底层不支持（http.ErrNotSupported，如某些包装层）时静默降级。
+//
+// 调用它时尚未触碰响应头，因此失败可以安全地当作"响应头未提交"。
+func (w *Writer) clearWriteDeadline() error {
+	err := http.NewResponseController(w.w).SetWriteDeadline(time.Time{})
+	if err == nil || errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
 
+	return classify(w.r.Context(), opStart, err)
+}
+
+// commitHeaders 设置 SSE 响应头、提交状态码并刷出。
+//
+// 与 clearWriteDeadline 分开是为了让 Stream 能区分"响应头未提交"与
+// "响应头已提交但刷新失败"——后者不能再提交第二次，否则标准库会报
+// superfluous response.WriteHeader。
+// 一旦进入本方法，响应头即视为已提交。
+func (w *Writer) commitHeaders() error {
 	header := w.w.Header()
 	header.Set("Content-Type", "text/event-stream; charset=utf-8")
 	header.Set("Cache-Control", "no-store, no-cache")
@@ -96,7 +112,12 @@ func (w *Writer) writeHeaders() error {
 	// 立即把响应头刷给客户端：响应头本身是惰性落地的（框架包装层尤其如此），
 	// 不刷则连接上一个字节都没有，前端 EventSource 要等到首帧才触发 onopen——
 	// 大模型首 token 可能几十秒，期间的空闲连接易被代理层掐断。
-	return w.flush(opStart)
+	//
+	// 这次刷新与后续帧共用 per-write deadline：刚才清零的是连接级截止时间，
+	// 若这里不设上界，异常或恶意连接能让 handler 无限期卡在起流上。
+	return w.withWriteDeadline(func() error {
+		return w.flush(opStart)
+	})
 }
 
 // Event 写入一条命名 SSE 事件，payload 自动 JSON 序列化；写入带 per-write deadline。
@@ -316,6 +337,8 @@ func (w *Writer) withWriteDeadline(fn func() error) error {
 
 		return fn()
 	}
+	// 恢复失败不额外上报:那意味着后续帧仍带这次已过期的截止时间,
+	// 下一次写入会立即失败并返回 ErrWriteTimeout——是延后一帧暴露,而非静默丢失。
 	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
 
 	return fn()

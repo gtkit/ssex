@@ -26,11 +26,16 @@ func WithWriteTimeout(d time.Duration) Option {
 	}
 }
 
-// newOptions 应用 Option 并回落到默认值。
+// newOptions 应用 Option 并回落到默认值;nil Option 跳过,
+// 公共构造函数不因调用方传入零值而 panic。
 func newOptions(opts []Option) options {
 	o := options{writeTimeout: defaultWriteTimeout}
 	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
 		opt(&o)
 	}
+
 	return o
 }

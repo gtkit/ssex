@@ -31,6 +31,18 @@ func WithQueueSize(n int) HubOption {
 // 保留最新的（latest-wins）即可。AI token 流每一条都是文本的一部分，
 // 少一条就损坏输出，应在 handler 内直接用 Stream.Data 写出，不经 Hub。
 //
+// 顺序契约：事件顺序在**单个连接内**按入队顺序保证。多个 goroutine 并发 Push /
+// Broadcast 时，它们之间的相对顺序由调度决定，不同连接可能观察到不同顺序。
+// 因此订单、登录这类状态事件应携带单调递增的 revision（放进 Event.ID 或载荷），
+// 消费端按 revision 取大者、忽略更旧的值。要提供跨推送方的全局顺序，就必须把所有
+// 投递串行化到单点，广播吞吐会退化为单 goroutine——而网络与客户端处理本身也不保证顺序。
+//
+// 容量建议：状态查询类场景用 WithQueueSize(1)。容量大于 1 只会积压已经过时的
+// 中间状态，增加内存占用与状态延迟；最新一条才是消费端需要的。
+//
+// 容量与限流：Hub 不做全局连接数上限、单 key 上限或 IP 限流——这些策略属于应用
+// 与网关。Online 与 Push 的返回值提供了做这些决策所需的原始信号。
+//
 // 并发安全。Hub 自身不写连接：Push 只把事件投进目标连接的有界队列，
 // 由持有连接的 handler 取出后写出。反过来（Hub 直接写）在 handler 返回后
 // 会踩到已失效的 ResponseWriter。
@@ -53,10 +65,13 @@ type subscriber struct {
 	ch chan Event
 }
 
-// NewHub 创建一个连接注册表。
+// NewHub 创建一个连接注册表；nil Option 跳过。
 func NewHub(opts ...HubOption) *Hub {
 	o := hubOptions{queueSize: defaultQueueSize}
 	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
 		opt(&o)
 	}
 

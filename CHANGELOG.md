@@ -6,42 +6,32 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 起流的响应头刷新纳入 per-write 写截止时间（`WithWriteTimeout`）。此前 `WriteHeaders` 先清除 `http.Server.WriteTimeout`、随后直接刷新，而逐帧截止时间只作用于后续帧，异常或恶意连接可以让 handler 无上界地卡在起流上。
+- 解除 `http.Server.WriteTimeout` 失败时不再静默继续：除 `http.ErrNotSupported`（底层不支持，降级）外一律返回错误，且此时响应头尚未提交、`Started()` 保持 false，调用方仍可改回普通 JSON。吞掉这个错误等于谎称长连接已保活，而连接其实仍会在全局写超时到期时被服务端中断。
+- `Option` 与 `HubOption` 跳过 nil，不再因调用方传入零值 Option 而 panic。
+
+### Changed
+
+- `Event.Data` 补充所有权约束：投递给 `Hub.Push` / `Hub.Broadcast` 后即视为交出所有权，同一份载荷会被多个连接在各自 goroutine 里序列化，投递后修改其中的 map / 切片 / 指针会构成数据竞争。
+- `Hub` 补充顺序契约：事件顺序在单个连接内按入队顺序保证，跨并发推送方的相对顺序由调度决定；状态事件应携带单调递增的 revision，消费端按 revision 取大者。状态查询类场景建议 `WithQueueSize(1)`。
+- `ErrInvalidArgument` 的文档措辞修正：只有首帧构造失败时响应头尚未提交，流已开始之后出现该错误仅表示这一帧被拒绝。
+- README 的 Hub handler 模板改为处理 `Start()` 错误、把心跳错误接进主 `select`，并新增应用级停机分支；新增大模型转发的上游约束（绑定下游 context、校验状态码与 `Content-Type`、始终关闭响应体、下游写失败即取消上游、token 不经 Hub）、优雅停机与运维边界（容量/限流归应用、建议监控的信号）两节。
+- CI 的 action 固定到 commit SHA，避免版本 tag 被移动导致构建不可复现。
+
 ## [v0.2.0] - 2026-07-31
 
-**⚠ 破坏性变更**：`New` / `NewStream` / `LastEventID` / `Writer.WriteHeaders` / `Stream.Start` 签名变更；Hub 队列溢出策略、错误类型、`Retry` 负值处理、注释与 `Raw` data 帧中孤立 `\r` 的处理、解码器的帧上限与 `retry` 取值范围均有变化。详见 Changed 区段。
+> 本段已修订：原先把 v0.1.0 引入的能力误记为本版本新增。v0.2.0 相对 v0.1.0 只包含以下修复与变更。
+> （v0.2.0 的 tag message 保留了修订前的措辞，标签已推送不可覆盖。）
 
-### Removed
-
-- ⚠ 移除对 `github.com/gin-gonic/gin` 的依赖。构造函数改用标准库接口后，模块的直接依赖只剩 `github.com/gtkit/json/v2`，随之移除的传递依赖包括 `quic-go`（HTTP/3 协议栈）、`mongo-driver/v2`（BSON 编解码）、`validator/v10`、`protobuf`、`go-yaml` 等，间接依赖数量从 30 个降到 13 个。
-
-  迁移写法：
-
-  ```go
-  // 旧
-  stream := ssex.NewStream(c)
-  id := ssex.LastEventID(c)
-
-  // 新
-  stream := ssex.NewStream(c.Writer, c.Request)
-  id := ssex.LastEventID(c.Request)
-  ```
-
-  行为无变化：per-write deadline、`http.Server.WriteTimeout` 清零、起流即刷头、`X-Accel-Buffering`、HTTP/2 头处理、错误分类在 gin 下全部经独立模块实测确认无回归（`http.ResponseController` 沿 gin `ResponseWriter` 的 `Unwrap` 链取到底层连接）。net/http、chi 等现在也可直接使用。
+**⚠ 破坏性变更**：`Writer.WriteHeaders` 与 `Stream.Start` 改为返回 `error`；Hub 队列溢出策略由丢弃新事件改为丢弃最旧事件；解码器对超限帧与超范围 `retry` 的处理变化。
 
 ### Added
 
-- 新增错误哨兵 `ErrInvalidArgument`（字段值含换行或 NUL、`retry` 为负、心跳间隔非正）、`ErrWriteTimeout`（单帧写入超过 `WithWriteTimeout`，慢客户端不等于断开）、`ErrFrameTooLarge`（解码时单帧超过 1MB）。加上既有的 `ErrClientGone`、`ErrStreamClosed`，写入与解码的全部失败类别都可用 `errors.Is` 判定，无需解析错误字符串。
+- 新增错误哨兵 `ErrInvalidArgument`（字段值含换行或 NUL、`retry` 为负、心跳间隔非正）、`ErrWriteTimeout`（单帧写入超过 `WithWriteTimeout`，慢客户端不等于断开）、`ErrFrameTooLarge`（解码时单帧超过 1MB）。
 - 新增 Fuzz 测试 `FuzzDecode` 与 `FuzzRoundTrip`，覆盖随机 CR/LF、非法 UTF-8、超大多行帧、超大 `retry`、提前停止迭代。
 - README 新增断线续传的正确做法（以存储为事实源 + 单调递增 revision + 先订阅后取快照）与浏览器接入边界（`EventSource` 只接受 URL 与 `withCredentials`，Bearer Token 与 POST 流需改用 `fetch`）。
-- 新增上游 SSE 解码器 `Decode(r io.Reader) iter.Seq2[Message, error]`，用于把上游大模型的 `text/event-stream` 转发给前端。按 WHATWG event stream 规范实现：支持 `CRLF` / `CR` / `LF` 三种行分隔符；字段值只剥掉冒号后的一个空格，`Data` 原样保留上游字节，增量 token 的前后空格与 `[DONE]` 这类非 JSON 哨兵都完整可用；多行 `data:` 以 `\n` 拼接；`ID` 与 `Retry` 按规范跨帧沿用，转发时 id 连续性得以保持；流尾不完整帧按规范丢弃；单帧上限 1MB，超限报错。实现对照规范章节的官方示例做了交叉验证。
-- 新增 `Hub`（`NewHub` / `Subscribe` / `Push` / `Broadcast` / `Online` / `WithQueueSize`）：按 key 管理在线连接，供支付回调、踢下线等带外场景定向推送或广播。Hub 只投递到每个连接的有界队列、由持有连接的 handler 写出；队列满即丢弃并把 `dropped` 返回给调用方，不阻塞推送方也不重试。Hub 无后台 goroutine，因此不需要关闭。
-- 新增 `Event` 结构与 `Stream.Send(Event)`：把"一条待推送事件"表达为值，供 Hub 的消费循环直接写出。
-- 新增 `Stream.Heartbeat(ctx, interval)`：阻塞式保活循环，由调用方显式在自己的 goroutine 里启动。
-- 新增 `Stream.Close`：发送一条约定的 `close` 事件并终止本流；终止后所有写入返回 `ErrStreamClosed`。用于解决服务端结束流后 `EventSource` 自动重连造成的无限重连——前端监听 `close` 事件并调用 `EventSource.close()`。
-- 新增错误哨兵 `ErrClientGone` 与 `ErrStreamClosed`：可用 `errors.Is` 区分"客户端已断开"（应静默结束并取消上游请求，如正在进行的大模型调用）与"真实写失败"（应记录告警）。
-- 新增 Option `WithWriteTimeout`，可配置单帧写入的截止时长（默认 10s，非正值忽略）；`New` 与 `NewStream` 相应接受可变 Option 参数。
-- 新增 Example 测试，覆盖大模型输出转发、订单状态推送、上游解码、Hub 定向推送与写超时配置。
-- 新增交叉验证测试：写侧输出交由解码器解回（含两处帧注入场景由解析器判决）、真实 HTTP 连接上客户端断开触发 `ErrClientGone`、Hub 与 Stream 在真实连接上的端到端推送、规范官方示例向量。
 
 ### Fixed
 
@@ -50,17 +40,27 @@
 - ⚠ 修复起流错误不可观察：`Writer.WriteHeaders` 与 `Stream.Start` 原先无返回值且忽略首次 `Flush` 失败，纯推送型 handler 起流即失败时会挂着白等。二者现在返回 `error`。
 - ⚠ 修复解码器的单帧上限只约束单行：`bufio.Scanner` 的 buffer 上限限制的是单个 token（这里是一行），由大量短 `data:` 行组成的一帧仍可让缓冲无限增长。现累计整帧字节数，越界返回 `ErrFrameTooLarge`；单行超长也归入同一判定。
 - ⚠ 修复 `retry` 字段的整数溢出：原实现用 `strconv.Atoi` 后直接乘 `time.Millisecond`，极大的合法数字会溢出成负的 `Duration`（最大 `int` 得到 `-1ms`）。现改用 `ParseUint` 并限制在不会溢出的范围内，超范围时按规范忽略该字段。
-- 修复注释帧的帧注入：注释文本中的孤立 `\r` 此前原样透传，而 SSE 规范以 `CRLF | CR | LF` 三者任一分行，客户端会据此另起一行并派发伪造事件。现已归一为换行并逐行加 `: ` 前缀。
-- 修复 `Raw` 透传 data 帧的同类注入：孤立 `\r` 此前不参与拆行。现已归一后逐行加 `data: ` 前缀。
-- 起流（`Writer.WriteHeaders` / `Stream.Start`）现在立即把响应头刷给客户端。此前 gin 的惰性响应头会把前端 `onopen` 推迟到首帧，大模型首 token 期间连接上零字节，易被代理层按空闲连接掐断。
-- 修正 README 中错误的模块路径（`github.com/gtkit/streaming/sse` → `github.com/gtkit/ssex`）及全部导入与调用示例——此前照抄 README 无法编译；同时修正包注释 `Package sse` → `Package ssex`。
 
 ### Changed
 
-- ⚠ 客户端断开时，写方法返回包装错误而非裸 `context.Canceled`。`errors.Is(err, context.Canceled)` 仍然成立，但 `err == context.Canceled` 不再成立。
-- ⚠ `Retry` 对负值毫秒返回错误且不写出任何字节。此前写出 `retry: -1`，客户端按规范静默忽略，属于静默失败。
-- ⚠ 注释帧与 `Raw` data 帧中的孤立 `\r`，由原样透传改为按 SSE 规范归一拆行。
-- 所有错误消息统一以包名 `ssex:` 开头（此前部分为 `sse:`，部分无前缀）。
 - 文档不再把解码器表述为"严格实现规范"：`Message.Data` 原样保留上游字节、不执行 UTF-8 解码替换，这是与规范的有意差异（转发链路上改写字节会让服务端交给前端的内容与上游不一致），已在 GoDoc 与 README 写明。
-- Makefile 移除 ORM 模板残留的 MySQL 集成测试目标与 DSN 配置；CI 固定 golangci-lint 版本（`latest` 会让构建结果随上游发布而变）并新增 Fuzz 步骤；`Version` 补 GoDoc；README 最小示例移除未使用的 import，依赖表述改为"唯一**直接**第三方依赖"。
-- README 补充错误判定、Option、`Close` 终止语义与前端不重连约定的说明。
+- Makefile 移除 ORM 模板残留的 MySQL 集成测试目标与 DSN 配置；CI 固定 golangci-lint 版本并新增 Fuzz 步骤；`Version` 补 GoDoc；README 最小示例移除未使用的 import，依赖表述改为"唯一**直接**第三方依赖"。
+
+## [v0.1.0] - 2026-07-31
+
+首个发布版本。以下能力均包含在本版本中（此前 CHANGELOG 曾把它们误记在 v0.2.0 的 Added 段下，现已归位）。
+
+### Added
+
+- 基于标准库 HTTP 接口的 SSE 写入器 `Writer` 与 `Stream`：统一 `text/event-stream` 响应头、起流即刷出响应头、每帧独立写截止时间、解除 `http.Server.WriteTimeout` 对长连接的写截止、下发 `X-Accel-Buffering: no`、HTTP/2 下省略 `Connection` 头。
+- 命名事件、带 `id` 事件、data-only 帧（`Event` / `EventWithID` / `Data` / `Send`）与 `Raw` 原样透传哨兵；`Comment` / `Ping` / `Heartbeat` 保活；`Retry` 重连建议；`Started` 起流状态；`Close` 终止流并抑制客户端自动重连。
+- 帧注入防护：`id` / `event` 字段值含换行或 NUL 时报错且不写字节；注释与原样透传载荷中的 `CRLF` 与孤立 `CR` 归一后逐行加前缀。
+- 错误哨兵 `ErrClientGone` 与 `ErrStreamClosed`，可用 `errors.Is` 区分客户端断开与服务端已终止流。
+- Functional Option `WithWriteTimeout`。
+- 上游 SSE 解码器 `Decode(r io.Reader) iter.Seq2[Message, error]`，用于把上游大模型的 `text/event-stream` 转发给前端：支持 `CRLF` / `CR` / `LF` 三种行分隔符；字段值只剥掉冒号后的一个空格，`Data` 原样保留上游字节；多行 `data:` 以 `\n` 拼接；`ID` 与 `Retry` 按规范跨帧沿用；流尾不完整帧按规范丢弃。实现对照规范章节的官方示例做了交叉验证。
+- 连接注册表 `Hub`（`NewHub` / `Subscribe` / `Push` / `Broadcast` / `Online` / `WithQueueSize`），供支付回调、踢下线等带外场景定向推送或广播。Hub 只投递到每个连接的有界队列、由持有连接的 handler 写出，无后台 goroutine，因此不需要关闭。
+- Example 测试与交叉验证测试（写侧输出交由解码器解回、真实连接上的断开检测、Hub 端到端、真实 HTTP/2）。
+
+### Changed
+
+- ⚠ 不依赖任何 web 框架：入口改用 `http.ResponseWriter` 与 `*http.Request`，因此 net/http、gin、chi 都可直接使用，模块的直接依赖只剩 `github.com/gtkit/json/v2`。gin 调用方写 `ssex.NewStream(c.Writer, c.Request)`。

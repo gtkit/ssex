@@ -402,17 +402,30 @@ if delivered == 0 {
 func Subscribe(c *gin.Context) {
     uid := c.GetString("uid")
     stream := ssex.NewStream(c.Writer, c.Request)
-    stream.Start() // 必须先起流：纯推送型 handler 在第一条事件到来前不写字节，
-                   // 不起流则前端一直等响应头、迟迟不触发 onopen
+
+    // 必须先起流：纯推送型 handler 在第一条事件到来前不写字节，
+    // 不起流则前端一直等响应头、迟迟不触发 onopen。
+    // 起流失败说明连接已不可用，此时响应头尚未提交，还能回普通 JSON。
+    if err := stream.Start(); err != nil {
+        return
+    }
 
     events, release := hub.Subscribe(uid)
     defer release()
 
-    go func() { _ = stream.Heartbeat(stream.Context(), 15*time.Second) }()
+    // 心跳错误要能被主循环看到：慢客户端会让心跳返回 ErrWriteTimeout，
+    // 而此时请求上下文可能还没结束，只丢弃错误会让 handler 继续空等。
+    hbErr := make(chan error, 1)
+    go func() { hbErr <- stream.Heartbeat(stream.Context(), 15*time.Second) }()
 
     for {
         select {
+        case <-shutdownCtx.Done(): // 应用级停机信号，见 6.9
+            _ = stream.Close(gin.H{"reason": "server shutting down"})
+            return
         case <-stream.Context().Done():
+            return
+        case <-hbErr: // 心跳写失败：连接已不可用
             return
         case e := <-events:
             if err := stream.Send(e); err != nil {
@@ -432,12 +445,14 @@ func Subscribe(c *gin.Context) {
 | `WithQueueSize(n)` | 每连接队列容量，默认 32，非正值忽略 |
 | 返回值 | `Push` / `Broadcast` 返回 `(delivered, dropped)`：`dropped` 是被挤掉的**旧**事件数 |
 
-四条使用约束：
+六条使用约束：
 
-1. **先 `Start()` 再进消费循环**：纯推送型 handler 在第一条事件到来前不写字节，起流才能让前端及时拿到响应头并触发 `onopen`；`Start()` 返回错误时直接返回，不必白等。
+1. **先 `Start()` 再进消费循环**：纯推送型 handler 在第一条事件到来前不写字节，起流才能让前端及时拿到响应头并触发 `onopen`；`Start()` 返回错误说明连接已不可用，直接返回。
 2. **投递与写出分离**：`Push` 只把事件放进队列，写出由持有连接的 handler 完成，因此写动作始终发生在 handler 自己的 goroutine、`ResponseWriter` 仍有效的窗口内。
 3. **队列满时保留最新（latest-wins）**：挤掉队首最旧的一条，让最新事件一定入队，`dropped` 是被挤掉的旧事件数。状态推送里最新一条描述的就是当前状态，必须送达。
-4. **适用边界**：Hub 面向**状态推送**——每条事件自带完整状态，丢掉中间过程无妨。AI token 流每一条都是文本的一部分，少一条就损坏输出，应在 handler 内直接用 `stream.Data` 写出，不经 Hub。
+4. **顺序只在单连接内保证**：多个 goroutine 并发 `Push` / `Broadcast` 时，它们之间的相对顺序由调度决定，不同连接可能观察到不同顺序。状态事件应携带**单调递增的 revision**（放进 `Event.ID` 或载荷），消费端按 revision 取大者、忽略更旧的值。
+5. **载荷投递后不可再改**：同一份 `Event.Data` 会被该 key 下的多个连接各自序列化，且发生在它们各自的 goroutine 里；投递后再修改其中的 map、切片或指针内容会构成数据竞争。需要复用结构体就投递前拷贝一份。
+6. **适用边界与容量**：Hub 面向**状态推送**——每条事件自带完整状态，丢掉中间过程无妨；状态查询类场景建议 `WithQueueSize(1)`，容量大于 1 只会积压已经过时的中间状态。AI token 流每一条都是文本的一部分，少一条就损坏输出，应在 handler 内直接用 `stream.Data` 写出，不经 Hub。
 
 消费循环用 `stream.Context().Done()` 退出，队列由 GC 回收。
 
@@ -447,9 +462,49 @@ func Subscribe(c *gin.Context) {
 
 先 `session`，中间连续 `chunk`，结束 `done`，出错 `error`；上游用 `Decode` 读，下游用 `Data` / `Send` 写。
 
+```go
+// 上游请求绑定下游 ctx：客户端一断开，上游请求随之取消
+upCtx, cancel := context.WithCancel(c.Request.Context())
+defer cancel()
+
+req, err := http.NewRequestWithContext(upCtx, http.MethodPost, upstreamURL, body)
+if err != nil {
+    return err
+}
+resp, err := httpClient.Do(req)
+if err != nil {
+    return err
+}
+defer func() { _ = resp.Body.Close() }() // 始终关闭，否则连接与 goroutine 泄漏
+
+if resp.StatusCode != http.StatusOK {
+    return fmt.Errorf("上游状态码 %d", resp.StatusCode)
+}
+if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+    return fmt.Errorf("上游 Content-Type 非 SSE: %q", ct) // 上游报错时常返回 JSON
+}
+
+for msg, err := range ssex.Decode(resp.Body) {
+    if err != nil {
+        return err
+    }
+    if string(msg.Data) == "[DONE]" {
+        break
+    }
+    if err := stream.Data(ssex.Raw(string(msg.Data))); err != nil {
+        cancel() // 下游断开或写超时：立刻停掉上游，别再为它烧 token
+        return nil
+    }
+}
+_ = stream.Close(gin.H{"reason": "done"})
+```
+
 要点：
 
-- 客户端断开时（`ErrClientGone`）必须取消上游请求，否则前端关了页面你还在为它烧 token
+- 上游请求用 `http.NewRequestWithContext` 绑定下游 `r.Context()`，并在下游写失败（`ErrClientGone` / `ErrWriteTimeout`）时立即 `cancel()`
+- 校验上游状态码与 `Content-Type`：上游出错时往往返回 JSON 而非事件流
+- `defer resp.Body.Close()` 一定要有
+- token 流在 handler 内直接写出，**不经 Hub**：Hub 的队列会在满时丢弃事件，而 token 少一条就损坏文本
 - 结束时用 `Close` 终止流，前端 `es.close()`，避免自动重连
 - 需要断线续传就用 `EventWithID` 带上 id，客户端重连时经 `LastEventID(r)` 读回起点，由业务决定从哪一条开始续推（见 6.7）
 
@@ -571,6 +626,35 @@ const resp = await fetch('/api/chat', {
 });
 const reader = resp.body.pipeThrough(new TextDecoderStream()).getReader();
 ```
+
+### 6.9 优雅停机要监听应用级信号
+
+`http.Server.Shutdown` 会等活跃连接变为空闲，而 SSE handler 只要还在循环就一直是活跃的——只依赖它，发布时会一直等到 `Shutdown` 的超时。
+
+因此长连接 handler 必须同时监听应用级的 shutdown context：收到信号后发 `Close`（让前端 `es.close()` 而不是重连），再返回。参见 4.14 的 handler 模板里的 `shutdownCtx` 分支。
+
+```go
+// 应用启动时准备一个全局停机 context
+shutdownCtx, shutdownDone := context.WithCancel(context.Background())
+
+// 收到停机信号：先让 SSE handler 收尾，再关 HTTP server
+shutdownDone()
+time.Sleep(gracePeriod) // 给正在收尾的流留出时间
+_ = srv.Shutdown(ctx)
+```
+
+### 6.10 容量、限流与监控由应用提供
+
+Hub 只维护注册表，不做全局连接数上限、单 key 连接上限或 IP 限流——这些策略属于应用与网关。库把做决策所需的原始信号交出来：
+
+| 信号 | 来源 |
+|---|---|
+| 在线连接数 / 单 key 连接数 | `Hub.Online(key)` |
+| 被挤掉的旧事件数 | `Push` / `Broadcast` 的 `dropped` 返回值 |
+| 客户端断开、写超时 | `ErrClientGone` / `ErrWriteTimeout` |
+| 帧超限 | `ErrFrameTooLarge` |
+
+生产上建议再自行记录：连接活跃时长与异常断开率、上游 AI 请求的取消率、每实例的文件描述符数量。
 
 ## 7. 测试
 

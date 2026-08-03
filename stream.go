@@ -183,8 +183,9 @@ func (s *Stream) send(op string, build func() (string, error)) error {
 
 // startLocked 首次调用时提交响应头。
 //
-// 连接已断开时响应头未提交,保持未开始状态;响应头一旦提交(即使随后刷新失败)
-// 就标记为已开始,避免重复提交触发标准库的 superfluous response.WriteHeader。
+// 连接已断开、或解除连接级写截止时间失败时,响应头都还没提交,保持未开始状态——
+// 调用方仍可改用普通 JSON 响应回错。响应头一旦提交(即使随后刷新失败)就标记为
+// 已开始,避免重复提交触发标准库的 superfluous response.WriteHeader。
 func (s *Stream) startLocked() error {
 	if s.started {
 		return nil
@@ -192,8 +193,11 @@ func (s *Stream) startLocked() error {
 	if err := s.writer.checkAlive(opStart); err != nil {
 		return err
 	}
+	if err := s.writer.clearWriteDeadline(); err != nil {
+		return err
+	}
 
 	s.started = true
 
-	return s.writer.writeHeaders()
+	return s.writer.commitHeaders()
 }
