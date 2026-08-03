@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 大模型转发模板（README 5.1）现在有可执行版本 `gincompat/relay_test.go`：模板此前只存在于 Markdown 里，已经反复出现过回归（遮蔽心跳错误、Transport 丢默认值、把截断当完成、缺显式起流）。现在用 `httptest` 假上游跑完整 handler，覆盖结束哨兵有/无、`Content-Type` 精确校验、校验通过即起流、长空闲期心跳保活、下游断开取消上游——模板改坏了测试会挂。
+- 修正 README 错误表对 `ErrFrameTooLarge` 的描述：原写"解码时单帧超过 1MB"，与统一后的实际口径不一致。上限按产出的 `Message.Data` 计，最多 1048575 字节。
+
 ## [v0.2.1] - 2026-08-03
 
 ### Added
@@ -16,7 +21,7 @@
 ### Fixed
 - ⚠ 修正 README 错误表里 `ErrInvalidArgument` 的处理建议：表格无条件写着"响应头尚未提交、可改回普通 JSON"，但这只在**首帧**失败时成立。流已开始后出现非法帧时 `Started()` 仍为 true，照表调用 `c.JSON` 会产生损坏的响应。表格已加上 `Started()` 的条件限定。
 - 修正大模型转发模板会对已写超时的连接再写终止帧：原先先 `closeStream` 再判断心跳是否失败，而心跳已因 `ErrWriteTimeout` 失败时说明连接写不动了——这次额外写入最坏还要再等一个 `WithWriteTimeout` 才失败，拖慢失败连接的释放并产生重复告警。改为先看心跳：已失败则跳过终止帧。
-- ⚠ 修复大模型转发模板会遮蔽心跳写错误：心跳失败后 `cancel()` 上游，`Decode` 随即返回 context canceled 并被循环直接 `return`——放在循环之后的"优先检查心跳错误"根本执行不到，真正的 `ErrWriteTimeout` 被上游读错误盖住，生产上丢掉"这条连接写不动"的信号。两个出口现在都走 `finalErr`，由它在上游读错误与心跳写错误之间挑出该报告的那个。
+- ⚠ 修复大模型转发模板会遮蔽心跳写错误：心跳失败后 `cancel()` 上游，`Decode` 随即返回 context canceled 并被循环直接 `return`——放在循环之后的"优先检查心跳错误"根本执行不到，真正的 `ErrWriteTimeout` 被上游读错误盖住，生产上丢掉"这条连接写不动"的信号。两个出口现在都走 `finish`，由它在上游读错误与心跳写错误之间挑出该报告的那个（该函数在同一批修复中曾短暂叫 `finalErr`，最终定名 `finish`，因为它还负责决定要不要写终止帧）。
 - ⚠ 修复大模型转发模板的 `http.Transport` 丢失标准库默认值：直接 `new(http.Transport)` 会丢掉 `ProxyFromEnvironment`（企业代理失效）、`ForceAttemptHTTP2`（自定义 `DialContext` 时不再尝试 HTTP/2）、`MaxIdleConns` / `IdleConnTimeout` / `ExpectContinueTimeout`。改为从 `http.DefaultTransport` 克隆后只覆盖阶段超时。
 - 修复解码 1MB 边界与公开契约不一致：`bufio.Scanner` 的 token 是一整行、含 `data: ` 前缀，前缀因此占掉了 data 的配额——实测 payload 到 1048569 字节可用、1048570 就被拒，而文档声明的是"data 内容累计 1MB"。行上限现在另留余量，是否超限统一由帧内累计判断决定，并新增 `TestDecodeFrameSizeBoundary` / `TestDecodeMultiLineBoundary` 钉住精确口径。
 - 大模型转发模板补显式 `Start()`：上游状态码与 `Content-Type` 校验通过后立即起流，否则响应头要等第一个 token（可能几十秒）或第一次心跳才提交。

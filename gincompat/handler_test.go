@@ -184,7 +184,7 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 		for {
 			select {
 			case <-deps.appShutdown.Done():
-				closeStream(stream, deps, gin.H{"reason": "server shutting down"})
+				closeStream(stream, gin.H{"reason": "server shutting down"}, reportVia(stream, deps))
 
 				return
 
@@ -218,7 +218,7 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 				lastRev = rev
 
 				if deps.terminal != nil && deps.terminal(e) {
-					closeStream(stream, deps, gin.H{"reason": "final"})
+					closeStream(stream, gin.H{"reason": "final"}, reportVia(stream, deps))
 
 					return
 				}
@@ -227,18 +227,27 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 	}
 }
 
-// closeStream 发送终止事件并上报失败。
+// closeStream 发送终止事件并上报失败。两个模板（订单推送与大模型转发）共用。
 //
 // 忽略这个错误的代价：终止帧没送达时前端收不到 close，会继续按重连间隔重连，
 // 而服务端没有任何信号。客户端已断开（ErrClientGone）属正常收尾，不必上报；
 // 写超时与未知写错误说明连接还在但帧没发出去，需要能被发现。
-func closeStream(stream *ssex.Stream, deps orderEventsDeps, payload gin.H) {
+func closeStream(stream *ssex.Stream, payload gin.H, report func(error)) {
 	err := stream.Close(payload)
 	if err == nil || errors.Is(err, ssex.ErrClientGone) {
 		return
 	}
-	if deps.onStreamError != nil {
-		deps.onStreamError(stream.Started(), err)
+	if report != nil {
+		report(err)
+	}
+}
+
+// reportVia 把 orderEventsDeps 的错误回调适配成 closeStream 需要的形状。
+func reportVia(stream *ssex.Stream, deps orderEventsDeps) func(error) {
+	return func(err error) {
+		if deps.onStreamError != nil {
+			deps.onStreamError(stream.Started(), err)
+		}
 	}
 }
 

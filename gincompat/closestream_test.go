@@ -42,8 +42,7 @@ func TestCloseStreamErrorReporting(t *testing.T) {
 		stream := ssex.NewStream(httptest.NewRecorder(), req)
 
 		reported := 0
-		deps := orderEventsDeps{onStreamError: func(bool, error) { reported++ }}
-		closeStream(stream, deps, gin.H{"reason": "final"})
+		closeStream(stream, gin.H{"reason": "final"}, func(error) { reported++ })
 
 		if reported != 0 {
 			t.Fatalf("上报次数 = %d, want 0（ErrClientGone 属正常收尾，不该产生告警）", reported)
@@ -57,8 +56,7 @@ func TestCloseStreamErrorReporting(t *testing.T) {
 		stream := ssex.NewStream(&timeoutWriter{headers: make(http.Header)}, req)
 
 		var got error
-		deps := orderEventsDeps{onStreamError: func(_ bool, err error) { got = err }}
-		closeStream(stream, deps, gin.H{"reason": "final"})
+		closeStream(stream, gin.H{"reason": "final"}, func(err error) { got = err })
 
 		if got == nil {
 			t.Fatal("终止帧写超时未上报：前端会收不到 close 而继续重连")
@@ -78,9 +76,8 @@ func TestCloseStreamErrorReporting(t *testing.T) {
 		stream := ssex.NewStream(httptest.NewRecorder(), req)
 
 		var got error
-		deps := orderEventsDeps{onStreamError: func(_ bool, err error) { got = err }}
 		// gin.H 里放一个无法序列化的值
-		closeStream(stream, deps, gin.H{"ch": make(chan int)})
+		closeStream(stream, gin.H{"ch": make(chan int)}, func(err error) { got = err })
 
 		if got == nil {
 			t.Fatal("终止帧序列化失败未上报")

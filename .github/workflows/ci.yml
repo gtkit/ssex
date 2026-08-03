@@ -22,6 +22,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Tidy check
+        run: go mod tidy -diff
+
       - name: Vet
         run: go vet ./...
 
@@ -32,6 +35,13 @@ jobs:
         with:
           version: v2.11.4
 
+      # 用 go install 固定版本，而不是依赖第三方 action 的参数语义
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+
+      - name: Gosec
+        run: gosec -quiet ./...
+
       - name: Test
         run: go test -race -count=1 -timeout=8m ./...
 
@@ -41,7 +51,7 @@ jobs:
           go test -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tail -1
           cov=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
-          awk -v c="$cov" 'BEGIN { if (c+0 < 80) { printf "✗ 覆盖率 %.1f%% < 80%%\n", c+0; exit 1 } }' 
+          awk -v c="$cov" 'BEGIN { if (c+0 < 80) { printf "✗ 覆盖率 %.1f%% < 80%%\n", c+0; exit 1 } }'
 
       - name: Benchmark
         run: go test -bench=. -benchmem -run='^$' ./...
@@ -61,9 +71,26 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Tidy check
+        working-directory: gincompat
+        run: go mod tidy -diff
+
       - name: Vet
         working-directory: gincompat
         run: go vet ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@55c2c1448f86e01eaae002a5a3a9624417608d84 # v6
+        with:
+          version: v2.11.4
+          working-directory: gincompat
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+
+      - name: Gosec
+        working-directory: gincompat
+        run: gosec -quiet ./...
 
       - name: Test
         working-directory: gincompat

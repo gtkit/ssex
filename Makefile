@@ -1,6 +1,7 @@
-.PHONY: tool fmt check test-gincompat tag release-patch release-minor gittag delcommit
+.PHONY: tool fmt check test-gincompat tag push-tag release-patch release-minor gittag delcommit
 #########################################
-#### 这是一个标准的发版 Makefile，包含 release-patch / release-minor / gittag / delcommit
+#### 这是一个标准的发版 Makefile，包含 release-patch / release-minor / push-tag / gittag / delcommit
+#### 发布分两步：release-* 跑门禁并推 main + 打本地标签；确认远端 CI 通过后再 push-tag
 ########################################
 
 LINT_TARGETS ?= ./...
@@ -41,6 +42,11 @@ tag:
 	@set -e; \
 	if [ -n "$$(git status --porcelain)" ]; then \
 		echo "✗ 工作区不干净，发版前请先提交或清理："; git status --short; exit 1; \
+	fi; \
+	last=$$(git describe --tags --abbrev=0 2>/dev/null || true); \
+	if [ -n "$$last" ]; then \
+		echo "▶️ 空白检查 (git diff --check $$last..HEAD)"; \
+		git diff --check "$$last..HEAD"; \
 	fi; \
 	echo "▶️ go mod tidy -diff"; go mod tidy -diff; \
 	echo "▶️ go vet"; go vet ./...; \
@@ -92,8 +98,25 @@ tag:
 		git tag -a "$$new" -m "$$(printf '版本 %s\n' "$$new")"; \
 	fi; \
 	git push $(RELEASE_REMOTE) HEAD; \
-	git push $(RELEASE_REMOTE) "$$new"; \
-	printf "Done: %s\n" "$$new"
+	printf "\n已推送 main，并在本地打好附注标签 %s。\n" "$$new"; \
+	printf "标签**尚未**发布到远端：Go module proxy 一旦抓取标签就永久不可变,\n"; \
+	printf "删除或覆盖都无法收回,因此先确认远端 CI 通过,再执行:\n\n    make push-tag\n\n"
+
+push-tag: ## 发布第二步：远端 CI 通过后，把 HEAD 上的标签推送到远端
+	@set -e; \
+	tag=$$(git describe --tags --exact-match HEAD 2>/dev/null || true); \
+	if [ -z "$$tag" ]; then \
+		echo "✗ HEAD 上没有标签。先执行 make release-patch / release-minor"; exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+		echo "✗ 工作区不干净，不应在此状态下发布标签："; git status --short; exit 1; \
+	fi; \
+	if git ls-remote --exit-code --tags $(RELEASE_REMOTE) "refs/tags/$$tag" >/dev/null 2>&1; then \
+		printf "✓ %s 已在远端，无需重复推送\n" "$$tag"; exit 0; \
+	fi; \
+	echo "▶️ 推送 $$tag 到 $(RELEASE_REMOTE)"; \
+	git push $(RELEASE_REMOTE) "$$tag"; \
+	printf "Published: %s\n" "$$tag"
 
 release-patch: ## 发布 PATCH 版本（bug 修复 / 文档 / 内部重构）
 	@$(MAKE) tag BUMP=patch

@@ -316,7 +316,7 @@ func closeStream(stream *ssex.Stream, payload any) {
 | `ErrStreamClosed` | 自己已 `Close` 过 | 调用顺序问题，检查业务逻辑 |
 | `ErrInvalidArgument` | 参数非法：字段值含换行/NUL、`retry` 为负、心跳间隔非正 | 编程错误。**仅当 `Started()` 为 false 时**（即首帧就失败）响应头尚未提交、可改回普通 JSON；流已开始后它只表示这一帧被拒，此时**不能**再写普通响应体 |
 | `ErrWriteTimeout` | 单帧写入超过 `WithWriteTimeout` | 客户端读取过慢，连接仍活着；按需告警 |
-| `ErrFrameTooLarge` | 解码时单帧超过 1MB | 上游异常或恶意，终止本次转发 |
+| `ErrFrameTooLarge` | 解码时单帧的 `Message.Data` 超过 1048575 字节 | 上游异常或恶意，终止本次转发 |
 | 其余 | 真实写失败 | 记录日志 / 告警 |
 
 `ErrClientGone` 的错误链保留原因，因此 `errors.Is(err, context.Canceled)` 同样成立。
@@ -705,6 +705,8 @@ func finish(stream *ssex.Stream, hbErr <-chan error, reason string, cause error)
 - 结束时用 `Close` 终止流，前端 `es.close()`，避免自动重连
 - 需要断线续传就用 `EventWithID` 带上 id，客户端重连时经 `LastEventID(r)` 读回起点，由业务决定从哪一条开始续推（见 6.7）
 
+这段模板的可执行版本在 [gincompat/relay_test.go](./gincompat/relay_test.go)：用 `httptest` 起假上游跑完整 handler，覆盖结束哨兵有/无、`Content-Type` 精确比较（含大小写变体与 `text/event-streaming` 这类前缀陷阱）、校验通过即起流、长空闲期心跳、下游断开取消上游。模板改坏了那里会挂，文档不会悄悄失真。
+
 ### 5.2 订单状态流
 
 先发一条 `status` 快照，后续由支付回调经 `Hub.Push` 带外推送，定期注释心跳，终态后 `Close`。
@@ -885,7 +887,7 @@ Hub 只维护注册表，不做全局连接数上限、单 key 连接上限或 I
 - [reliability_test.go](./reliability_test.go)
 - [fuzz_test.go](./fuzz_test.go)
 - [startup_test.go](./startup_test.go)
-- [gincompat/](./gincompat)（独立模块：gin 集成回归，17 个测试）
+- [gincompat/](./gincompat)（独立模块：gin 集成回归，24 个测试）
 - [example_test.go](./example_test.go)
 
 覆盖点包括：
@@ -905,7 +907,8 @@ Hub 只维护注册表，不做全局连接数上限、单 key 连接上限或 I
 - 可靠性：Hub latest-wins（最新状态送达、连续溢出只留最后一条、容量窗口）、帧构造失败时不提交响应头、起流错误可观察、整帧与单行大小上限、`retry` 溢出、非法 UTF-8 原样保留
 - Fuzz：`FuzzDecode` 与 `FuzzRoundTrip`（随机 CR/LF、非法 UTF-8、超大多行帧、超大 retry、提前停止迭代）
 - 起流写路径：刷新受 per-write deadline 约束、解除连接级截止时间失败时不提交响应头、nil Option 被跳过
-- gin 集成（`gincompat` 独立模块）：鉴权在起流前拒绝、快照+推送+终态 `Close`、心跳 goroutine 在 handler 返回前收尾（`-race` 并发多轮）、长连接不被 `WriteTimeout` 截断、断开判定、`Started()` 分界、应用停机收尾
+- gin 集成（`gincompat` 独立模块）：鉴权在起流前拒绝、快照+推送+终态 `Close`、心跳 goroutine 在 handler 返回前收尾（`-race` 并发多轮）、长连接不被 `WriteTimeout` 截断、断开判定、`Started()` 分界、应用停机收尾、跨租户隔离与 scope key 无碰撞
+- AI 转发模板（5.1 的可执行版本，`gincompat/relay_test.go`）：结束哨兵有/无（缺哨兵必须报 `incomplete`）、上游状态码与 `Content-Type` 精确校验、校验通过即起流、长空闲期心跳保活、下游断开取消上游
 
 ## 8. 依赖与版本
 
