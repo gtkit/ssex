@@ -12,6 +12,18 @@
 - README 新增「Gin 集成」一节：完整 handler 模板（鉴权 → 起流错误 → 先订阅后快照 → 心跳收尾 → 四出口事件循环）、以 `Started()` 分界的错误处理规范与错误分级、中间件兼容清单与路由组隔离、`c.Writer` 生命周期约束。
 
 ### Fixed
+- ⚠ 修复关闭状态的错误契约与实现不一致：`send` 与 `Close` 原先先构造帧、后检查 `closed`，于是"流已终止 + 载荷不可序列化"返回的是序列化错误，而文档承诺的是"终止后任何写入都返回 `ErrStreamClosed`"——调用方按 `errors.Is` 判断会漏掉"流已经关了"这个事实。改为状态先于参数：终止后一律返回 `ErrStreamClosed`，不再构造帧。流未终止时构造失败仍返回构造错误且不提交响应头（既有契约不变）。
+- ⚠ 修复 `Close` 起流失败后仍能再次 `Start` 的状态机缺口：`Close` 在起流失败时会把流标记为已终止，而 `startLocked` 当时不检查 `closed`，随后的 `Start` 会成功提交响应头，形成 `started` 与 `closed` 同时为真的矛盾状态。`startLocked` 现在先检查 `closed`。
+- 大模型转发模板补长空闲保活：模型思考、工具调用期间下游没有字节，链路上任何一层的空闲超时都会在模型仍在工作时掐断连接。模板启动 `Heartbeat`，心跳失败连带取消上游（转发循环阻塞在读上游、无法同时 select 心跳错误），并在循环退出后优先按心跳错误报告。
+- 大模型转发模板补上游客户端的阶段超时说明：`http.Client.Timeout` 覆盖整个响应体读取周期，会掐断正常长流；改为配置 `DialContext` / `TLSHandshakeTimeout` / `ResponseHeaderTimeout`，最长生成时长用 `context.WithTimeout` 单独控制。
+- ⚠ 修正大模型转发模板会把截断当成正常完成：原先收到 `[DONE]` 就 `break`，但循环还可能因上游正常 EOF、代理提前结束响应、上游异常关闭而结束——那几种情况内容是截断的，模板却一律发 `close(reason=done)`，前端会把半截回答当成最终答案。现记录是否真的收到结束哨兵，未收到时发 `close(reason=incomplete)` 并返回错误。
+- 修正上游 `Content-Type` 判断：`strings.HasPrefix` 会接受 `text/event-streaming`、`text/event-stream-error` 这类非 SSE 类型，又会拒绝合法的大小写与空白变体。改用 `mime.ParseMediaType` 解析后精确比较。
+- ⚠ 修正优雅停机模板的 `WaitGroup` 竞态：上一版让 `shutdownDone()` → `streams.Wait()` → `srv.Shutdown()`，但 `Wait()` 期间监听器还没关，新请求的 handler 仍会 `Add(1)`，而 `sync.WaitGroup` 要求"计数器为零时开始的正数 `Add` 必须发生在 `Wait` 之前"——既可能漏等新 handler，也是对 `WaitGroup` 的误用。`WaitGroup` 本身也是多余的：`Shutdown` 会先关闭监听器阻止新请求、再等活动连接变空闲，而 handler 收到停机信号后 `Close` 并返回时连接就变空闲了。模板已简化为 `shutdownDone()` → `Shutdown()`。
+- `Stream.Close` 的错误不再一律忽略：终止帧没送达时前端收不到 `close`、会继续按重连间隔重连，而服务端毫无信号。模板改为除 `ErrClientGone`（正常收尾）外都上报，`gincompat` 抽出 `closeStream` 统一处理，并补上覆盖其两条契约的 `TestCloseStreamErrorReporting`（`ErrClientGone` 不上报、写超时与序列化失败要上报），该测试经双向反向验证。
+- ⚠ 修复跨租户回归测试的负向断言无效：它在推送**之后**另开一个订阅来检查泄漏，而 Hub 不重放历史事件，那个通道天然为空——无论隔离是否生效都会通过。现改为给两个租户各推一条自己的终态事件，读各自**真实连接**的完整 id 序列再断言。已用反向验证确认有效：临时去掉 key 的租户作用域后测试立即失败。
+- 模板新增授权结果的二次校验：授权实现若因 bug 返回零值标识与 `nil` error，`scopeKey()` 会退化成一个固定值，多个异常请求就此落进同一队列、互相串流。现检查租户与资源标识均非空，把这类 bug 从静默串流降级成一次 403，并新增 `TestZeroAuthResultIsRejected`。
+- 修正大模型转发模板吞掉所有下游写错误：原先一律 `return nil`，把 `ErrWriteTimeout` 与未知写错误也当成正常断开，与 9.3 的错误分级规范矛盾。现按分级处理——断开与上下文取消正常收尾，其余向上返回以便告警。
+- 修正优雅停机示例：原先用固定 `time.Sleep` 且忽略 `Shutdown` 返回值。固定等待既不能保证 handler 退干净，也会无谓拖长停机。现用 `WaitGroup` 等待所有 SSE handler 退出，并处理 `Shutdown` 错误。
 - ⚠ 修复 README 与 `gincompat` 可执行模板的漂移：README 声称"模板的可执行版本在 `gincompat/handler_test.go`，模板变化会导致测试失败"，但上一轮只改了 README——`gincompat` 的 handler 仍只检查 uid、直接用裸 `orderID` 订阅、`load` 不带租户作用域。因此远端 CI 全绿也无法证明 README 新增的租户隔离与授权顺序是正确的。已让 `gincompat` handler 与 README 9.2 完全对齐（identity/tenant、资源授权、scoped key、同作用域读快照），并补上走真实 handler 链路的跨租户回归测试。
 - ⚠ 修复完整模板的作用域漂移：授权用 `Authorize(ctx, tenantID, uid, orderID)`，读快照却只用 `Load(ctx, orderID)`。若 `orderID` 只在租户内唯一，快照可能读到另一个租户的数据。已改为授权返回内部安全标识、后续 `ScopeKey()` 与 `Load` 都沿用它。
 - 修复 key 的分隔符碰撞：`tenantID + ":" + orderID` 在任一段含分隔符时会碰撞（`"a:b"+":"+"c"` 与 `"a"+":"+"b:c"` 得到同一个 key，两个不相关资源共享事件队列）。示范实现改用长度前缀编码并封装成统一构造函数，新增 `TestScopeKeyHasNoCollision`。
@@ -36,8 +48,9 @@
 - 修正 README 的心跳模板：原写法只发停止信号、不等 goroutine 退出。gin 的 `c.Writer` 是 `Context` 的内部字段，handler 返回后 `Context` 归还对象池并在下个请求中被重置，因此心跳 goroutine 若在 handler 返回后仍在写入，就会写到另一个请求的响应上。模板改为独立 ctx + `defer stop(); <-hbDone` 等待退出。
 
 ### Changed
+- `Hub.Online` 的定位改为"监控与近似判断"：它只是某个时刻单个 key 的快照，也不提供全局在线总数，`if Online(key) < limit { Subscribe(key) }` 是非原子的 check-then-act，并发请求照样突破上限。严格限流应由应用级 semaphore、原子计数器或网关完成（GoDoc 与 README 6.10 同步）。
 - `Hub` 的 GoDoc 与 README 新增两条硬边界：**Hub 只管当前进程的连接**（多实例部署时连接在实例 A、回调打到实例 B 会导致 `Push` 找不到连接，需要每个实例都收到状态事件后各自推本地 Hub，或用一致性哈希路由；存储始终是事实源），以及 **key 必须是服务端计算的安全作用域**（两个租户的同名 ID 会落进同一 key 造成跨租户串流，禁止空 key，`Broadcast` 只用于全员可见内容）。
-- README 9.2 模板把资源授权与读取快照拆开：授权先做可避免产生未授权订阅（会让 `Online` 出现伪在线）；key 改用 `tenantID:orderID` 形态。
+- README 9.2 模板把资源授权与读取快照拆开：授权先做可避免产生未授权订阅（会让 `Online` 出现伪在线）；key 改用统一构造函数生成的长度前缀安全编码（不是裸 `tenantID:orderID` 拼接，后者在任一段含分隔符时会碰撞）。
 
 - `Stream` 与 `Stream.Heartbeat` 的 GoDoc 补写生命周期约束：底层 `http.ResponseWriter` 只在 handler 执行期间有效，在 handler goroutine 之外写入的 goroutine 必须在 handler 返回前退出；`c.Copy()` 的副本只能读请求元数据（gin 会把副本的 `ResponseWriter` 置为 nil），不能用于写响应。
 - `Event.Data` 补充所有权约束：投递给 `Hub.Push` / `Hub.Broadcast` 后即视为交出所有权，同一份载荷会被多个连接在各自 goroutine 里序列化，投递后修改其中的 map / 切片 / 指针会构成数据竞争。

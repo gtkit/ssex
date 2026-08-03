@@ -44,6 +44,13 @@ func (r resource) scopeKey() string {
 	return fmt.Sprintf("%d:%s:%d:%s", len(r.tenantID), r.tenantID, len(r.internalID), r.internalID)
 }
 
+// valid 判断授权结果是否可用。授权实现若因 bug 返回零值 resource 与 nil error，
+// scopeKey() 会得到一个固定值，多个异常请求会落进同一个队列、互相串流。
+// 因此订阅之前必须确认租户与资源标识都非空。
+func (r resource) valid() bool {
+	return r.tenantID != "" && r.internalID != ""
+}
+
 // orderEventsDeps 是模板 handler 需要的依赖，测试按用例注入。
 type orderEventsDeps struct {
 	hub         *ssex.Hub
@@ -104,15 +111,25 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 			return
 		}
 
-		// 3. key 由服务端从已授权资源计算，带租户作用域
+		// 3. 二次校验授权结果：授权实现若因 bug 返回零值 resource 与 nil error，
+		//    scopeKey() 会得到一个固定值（"0::0:"），多个异常请求就此落进同一个
+		//    队列、互相收到对方的事件。这层检查把"授权实现的 bug"从静默串流
+		//    降级成一次 403。
+		if !res.valid() {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "无权访问"})
+
+			return
+		}
+
+		// 4. key 由服务端从已授权资源计算，带租户作用域
 		key := res.scopeKey()
 
-		// 4. 先订阅，再读快照。顺序反过来会永久漏事件：Load 与 Subscribe 之间
+		// 5. 先订阅，再读快照。顺序反过来会永久漏事件：Load 与 Subscribe 之间
 		//    发生的状态变更此时无人订阅，推送直接丢弃，客户端会永远停在旧快照上。
 		events, release := deps.hub.Subscribe(key)
 		defer release()
 
-		// 5. 用同一个已验证标识读快照——不能退回只用裸 orderID，否则作用域漂移。
+		// 6. 用同一个已验证标识读快照——不能退回只用裸 orderID，否则作用域漂移。
 		load := deps.load
 		if load == nil {
 			load = func(context.Context, resource) (int64, gin.H, error) {
@@ -128,21 +145,21 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 
 		stream := ssex.NewStream(c.Writer, c.Request, ssex.WithWriteTimeout(10*time.Second))
 
-		// 6. 起流失败时响应头尚未提交，仍可回 JSON
+		// 7. 起流失败时响应头尚未提交，仍可回 JSON
 		if err := stream.Start(); err != nil {
 			handleStreamError(c, stream, deps, err)
 
 			return
 		}
 
-		// 7. 发快照，revision 放进事件 id
+		// 8. 发快照，revision 放进事件 id
 		if err := stream.EventWithID(strconv.FormatInt(snapRev, 10), "status", snapshot); err != nil {
 			handleStreamError(c, stream, deps, err)
 
 			return
 		}
 
-		// 8. 心跳：独立 ctx；错误走 hbErr，"已退出"走 hbDone。
+		// 9. 心跳：独立 ctx；错误走 hbErr，"已退出"走 hbDone。
 		//    两者必须分开：若用同一个 channel 兼任，主循环的 case 消费掉唯一那次
 		//    发送后，defer 里的第二次接收就永远等不到发送者——handler 永久阻塞，
 		//    连排在后面的 release() 都不会执行。hbDone 用 close，读多少次都不会阻塞。
@@ -160,14 +177,14 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 			<-hbDone
 		}()
 
-		// 9. 事件循环：四个退出口。lastRev 从快照起步并随成功发送推进——
+		// 10. 事件循环：四个退出口。lastRev 从快照起步并随成功发送推进——
 		//    只比快照不够：Hub 不保证跨推送方的到达顺序，快照之后仍可能先到
 		//    revision 10、后到 revision 9，只比快照会把 9 也转发出去，前端状态回退。
 		lastRev := snapRev
 		for {
 			select {
 			case <-deps.appShutdown.Done():
-				_ = stream.Close(gin.H{"reason": "server shutting down"})
+				closeStream(stream, deps, gin.H{"reason": "server shutting down"})
 
 				return
 
@@ -201,12 +218,27 @@ func orderEvents(deps orderEventsDeps) gin.HandlerFunc {
 				lastRev = rev
 
 				if deps.terminal != nil && deps.terminal(e) {
-					_ = stream.Close(gin.H{"reason": "final"})
+					closeStream(stream, deps, gin.H{"reason": "final"})
 
 					return
 				}
 			}
 		}
+	}
+}
+
+// closeStream 发送终止事件并上报失败。
+//
+// 忽略这个错误的代价：终止帧没送达时前端收不到 close，会继续按重连间隔重连，
+// 而服务端没有任何信号。客户端已断开（ErrClientGone）属正常收尾，不必上报；
+// 写超时与未知写错误说明连接还在但帧没发出去，需要能被发现。
+func closeStream(stream *ssex.Stream, deps orderEventsDeps, payload gin.H) {
+	err := stream.Close(payload)
+	if err == nil || errors.Is(err, ssex.ErrClientGone) {
+		return
+	}
+	if deps.onStreamError != nil {
+		deps.onStreamError(stream.Started(), err)
 	}
 }
 

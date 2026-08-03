@@ -70,7 +70,10 @@ func WithQueueSize(n int) HubOption {
 //   - 终态事件到达后回读一次事实源做校准，不完全相信内存队列。
 //
 // 容量与限流：Hub 不做全局连接数上限、单 key 上限或 IP 限流——这些策略属于应用
-// 与网关。Online 与 Push 的返回值提供了做这些决策所需的原始信号。
+// 与网关。Online 与 Push 的返回值可以用于监控与近似判断，但**不能用来做严格限流**:
+// Online 只是某个时刻单个 key 的快照，也不提供全局在线总数，
+// "if Online(key) < limit { Subscribe(key) }" 是非原子的 check-then-act,
+// 并发请求照样会突破上限。严格限流请用应用级 semaphore、原子计数器或网关。
 //
 // 并发安全。Hub 自身不写连接：Push 只把事件投进目标连接的有界队列，
 // 由持有连接的 handler 取出后写出。反过来（Hub 直接写）在 handler 返回后

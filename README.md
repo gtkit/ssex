@@ -124,7 +124,7 @@ func StreamDemo(w http.ResponseWriter, r *http.Request) {
     if err := stream.Event("status", map[string]string{"status": "pending"}); err != nil {
         return
     }
-    _ = stream.Close(map[string]string{"reason": "done"})
+    _ = stream.Close(map[string]string{"reason": "done"}) // 生产代码要处理它，见 4.9
 }
 ```
 
@@ -279,7 +279,10 @@ if err != nil {
 
 ```go
 // 服务端：终态后终止流
-_ = stream.Close(gin.H{"reason": "delivered"})
+if err := stream.Close(gin.H{"reason": "delivered"}); err != nil {
+    // 终止帧没送达前端会继续重连，除客户端已断开外都要能发现（见下）
+    logger.Warn("发送终止事件失败", zap.Error(err))
+}
 ```
 
 ```js
@@ -289,6 +292,19 @@ es.addEventListener('close', () => es.close());
 
 `Close` 只终结本流的写入许可，不关闭 HTTP 连接（连接在 handler 返回时结束）。
 终止后任何写入返回 `ssex.ErrStreamClosed`，重复 `Close` 同样返回它。
+
+**它的错误不该一律忽略。** 终止帧没送达时前端收不到 `close`，会继续按重连间隔重连，而服务端毫无信号。客户端已断开（`ErrClientGone`）属正常收尾，其余要能被发现：
+
+```go
+func closeStream(stream *ssex.Stream, payload any) {
+    err := stream.Close(payload)
+    if err == nil || errors.Is(err, ssex.ErrClientGone) {
+        return // 正常收尾
+    }
+    // 写超时或未知写错误：连接还在但帧没发出去，前端会继续重连
+    logger.Warn("发送终止事件失败", zap.Error(err))
+}
+```
 
 ### 4.10 错误判定
 
@@ -462,7 +478,7 @@ func Subscribe(c *gin.Context) {
     for {
         select {
         case <-shutdownCtx.Done(): // 应用级停机信号，见 6.9
-            _ = stream.Close(gin.H{"reason": "server shutting down"})
+            closeStream(stream, gin.H{"reason": "server shutting down"}) // 见 4.9
             return
         case <-stream.Context().Done():
             return
@@ -525,6 +541,7 @@ AI 对话流在 handler 内直连上游、不经 Hub，因此不受这条限制�
 - **禁止空 key**：空 key 会让所有认证异常的请求共享同一个队列、互相收到对方的事件
 - **不要裸拼接**：`"a:b" + ":" + "c"` 与 `"a" + ":" + "b:c"` 会得到同一个 key。用长度前缀编码或服务端生成的全局唯一 ID，并统一封装成一个 key 构造函数，禁止业务代码各自拼接
 - **读资源时沿用授权阶段的同一标识**，不要退回裸资源 ID——否则快照可能读到另一个租户的数据
+- **订阅前二次校验授权结果**：授权实现若因 bug 返回零值标识与 `nil` error，key 会退化成一个固定值，多个异常请求就此落进同一队列。检查租户与资源标识都非空，可以把这类 bug 从静默串流降级成一次 403
 - `Broadcast` 只用于确实允许所有在线用户看到的内容
 
 `gincompat` 里的 `resource.scopeKey()` 用长度前缀编码做了示范，并有 `TestScopeKeyHasNoCollision` 与走真实 handler 的 `TestTenantCannotReachOtherTenantOrder` 两个回归测试。
@@ -535,16 +552,31 @@ AI 对话流在 handler 内直连上游、不经 Hub，因此不受这条限制�
 
 先 `session`，中间连续 `chunk`，结束 `done`，出错 `error`；上游用 `Decode` 读，下游用 `Data` / `Send` 写。
 
+上游客户端要按**阶段**设超时，不要用 `http.Client.Timeout`——它覆盖整个响应体读取周期，会把正常的长流掐断：
+
 ```go
-// 上游请求绑定下游 ctx：客户端一断开，上游请求随之取消
-upCtx, cancel := context.WithCancel(c.Request.Context())
+// 全局复用一个客户端。Timeout 留零值，改为限制建连、TLS 与等响应头这三个阶段；
+// "最长生成时长"由业务用 context.WithTimeout 单独控制。
+var upstreamClient = &http.Client{
+    Transport: &http.Transport{
+        DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+        TLSHandshakeTimeout:   5 * time.Second,
+        ResponseHeaderTimeout: 30 * time.Second, // 首个响应头就绪的上限，不含流式响应体
+    },
+}
+```
+
+```go
+// 上游请求绑定下游 ctx：客户端一断开，上游请求随之取消；
+// 同时叠加一个业务级的最长生成时长。
+upCtx, cancel := context.WithTimeout(c.Request.Context(), maxGenerationTime)
 defer cancel()
 
 req, err := http.NewRequestWithContext(upCtx, http.MethodPost, upstreamURL, body)
 if err != nil {
     return err
 }
-resp, err := httpClient.Do(req)
+resp, err := upstreamClient.Do(req)
 if err != nil {
     return err
 }
@@ -553,31 +585,92 @@ defer func() { _ = resp.Body.Close() }() // 始终关闭，否则连接与 gorou
 if resp.StatusCode != http.StatusOK {
     return fmt.Errorf("上游状态码 %d", resp.StatusCode)
 }
-if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
-    return fmt.Errorf("上游 Content-Type 非 SSE: %q", ct) // 上游报错时常返回 JSON
+
+// 用 mime.ParseMediaType 精确比较，不要 strings.HasPrefix：后者会接受
+// text/event-streaming、text/event-stream-error 这类非 SSE 类型，
+// 又会拒绝合法的大小写与空白变体（media type 本身大小写不敏感）。
+rawCT := resp.Header.Get("Content-Type")
+mediaType, _, err := mime.ParseMediaType(rawCT)
+if err != nil || mediaType != "text/event-stream" {
+    return fmt.Errorf("上游 Content-Type 非 SSE: %q", rawCT) // 上游报错时常返回 JSON
 }
 
+// 上游校验通过后启动心跳：模型思考、工具调用、上游暂时停顿期间下游一个字节
+// 都没有，网关 / CDN / Ingress 的空闲超时会在模型还在工作时掐断连接。
+//
+// 心跳失败要连带取消上游——转发循环阻塞在读上游，没法同时 select hbErr，
+// 靠 cancel 让 Decode 的读失败、循环自然退出。
+hbCtx, stopHeartbeat := context.WithCancel(c.Request.Context())
+hbErr := make(chan error, 1)
+hbDone := make(chan struct{})
+go func() {
+    defer close(hbDone)
+    if err := stream.Heartbeat(hbCtx, 15*time.Second); err != nil {
+        hbErr <- err
+        cancel() // 下游写不出去了，别再让上游继续生成
+    }
+}()
+defer func() {
+    stopHeartbeat()
+    <-hbDone // 等心跳退出，见 9.1
+}()
+
+// completed 记录是否真的收到了结束哨兵。循环还可能因为上游正常 EOF、
+// 代理提前结束响应、上游异常关闭但没返回读取错误而结束——那几种情况下
+// 内容是被截断的，绝不能当成正常完成。
+var completed bool
 for msg, err := range ssex.Decode(resp.Body) {
     if err != nil {
         return err
     }
     if string(msg.Data) == "[DONE]" {
+        completed = true
+
         break
     }
     if err := stream.Data(ssex.Raw(string(msg.Data))); err != nil {
-        cancel() // 下游断开或写超时：立刻停掉上游，别再为它烧 token
-        return nil
+        cancel() // 无论哪种失败都要停掉上游，别再为它烧 token
+
+        // 按 9.3 的分级处理：断开是正常收尾，写超时与未知错误要能告警
+        if errors.Is(err, ssex.ErrClientGone) || errors.Is(err, context.Canceled) {
+            return nil
+        }
+        return err
     }
 }
-_ = stream.Close(gin.H{"reason": "done"})
+
+// 心跳失败是循环退出的可能原因之一，优先按它报告
+select {
+case err := <-hbErr:
+    closeStream(stream, gin.H{"reason": "incomplete"})
+
+    if errors.Is(err, ssex.ErrClientGone) || errors.Is(err, context.Canceled) {
+        return nil // 下游已断开，正常收尾
+    }
+
+    return err
+default:
+}
+
+if !completed {
+    // 让前端能区分"生成完成"与"被截断"：终止原因不同，前端可以据此提示重试，
+    // 而不是把半截回答当成最终答案。
+    closeStream(stream, gin.H{"reason": "incomplete"})
+
+    return errors.New("上游未返回结束哨兵，输出可能被截断")
+}
+closeStream(stream, gin.H{"reason": "done"}) // 终止帧失败要能发现，见 4.9
 ```
 
 要点：
 
 - 上游请求用 `http.NewRequestWithContext` 绑定下游 `r.Context()`，并在下游写失败（`ErrClientGone` / `ErrWriteTimeout`）时立即 `cancel()`
-- 校验上游状态码与 `Content-Type`：上游出错时往往返回 JSON 而非事件流
+- 校验上游状态码，并用 `mime.ParseMediaType` 精确比较 `Content-Type`：上游出错时往往返回 JSON 而非事件流
+- **区分"收到结束哨兵"与"只是读到 EOF"**：后者意味着内容被截断（上游异常关闭、代理提前结束响应都会走到这里），必须用不同的终止原因告诉前端，否则半截回答会被当成完整答案
 - `defer resp.Body.Close()` 一定要有
 - token 流在 handler 内直接写出，**不经 Hub**：Hub 的队列会在满时丢弃事件，而 token 少一条就损坏文本
+- **长空闲期要有心跳**：模型思考、工具调用期间下游没有字节，链路上任何一层的空闲超时都会掐断连接。只有当上游能保证最大空闲间隔小于链路最短 idle timeout 时才可以省掉心跳
+- **上游客户端按阶段设超时**：`http.Client.Timeout` 覆盖整个响应体读取，会掐断正常长流；改用 `DialContext` / `TLSHandshakeTimeout` / `ResponseHeaderTimeout`，最长生成时长用 `context.WithTimeout` 控制
 - 结束时用 `Close` 终止流，前端 `es.close()`，避免自动重连
 - 需要断线续传就用 `EventWithID` 带上 id，客户端重连时经 `LastEventID(r)` 读回起点，由业务决定从哪一条开始续推（见 6.7）
 
@@ -710,19 +803,25 @@ const reader = resp.body.pipeThrough(new TextDecoderStream()).getReader();
 
 ### 6.9 优雅停机要监听应用级信号
 
-`http.Server.Shutdown` 会等活跃连接变为空闲，而 SSE handler 只要还在循环就一直是活跃的——只依赖它，发布时会一直等到 `Shutdown` 的超时。
+`http.Server.Shutdown` 会先关闭监听器、再关闭空闲连接，然后等活动连接变空闲。SSE handler 只要还在循环就一直是活动的——因此**只调 `Shutdown` 而 handler 不监听停机信号**，会一直等到 `Shutdown` 的 context 超时。
 
-因此长连接 handler 必须同时监听应用级的 shutdown context：收到信号后发 `Close`（让前端 `es.close()` 而不是重连），再返回。参见 4.14 的 handler 模板里的 `shutdownCtx` 分支。
+反过来，handler 一旦监听了应用级停机信号，`Shutdown` 自己就完成了等待：信号让 handler `Close` 并返回 → 连接变空闲 → `Shutdown` 返回。
 
 ```go
 // 应用启动时准备一个全局停机 context
 shutdownCtx, shutdownDone := context.WithCancel(context.Background())
 
-// 收到停机信号：先让 SSE handler 收尾，再关 HTTP server
-shutdownDone()
-time.Sleep(gracePeriod) // 给正在收尾的流留出时间
-_ = srv.Shutdown(ctx)
+// 收到停机信号
+shutdownDone() // 让所有 SSE handler 走 Close 分支主动收尾（见 9.2 模板的 appShutdown 分支）
+
+// Shutdown 关掉监听器后不再有新请求，随后等已有连接变空闲——
+// 正在收尾的 SSE handler 返回时连接就变空闲了。
+if err := srv.Shutdown(ctx); err != nil {
+    logger.Error("优雅停机未在期限内完成", zap.Error(err))
+}
 ```
+
+**不要额外维护一个统计在线 handler 的 `WaitGroup` 再 `Wait()`**：`Wait()` 期间监听器还没关，新请求的 handler 仍会 `Add(1)`，而 `sync.WaitGroup` 要求"计数器为零时开始的正数 `Add` 必须发生在 `Wait` 之前"——这既可能漏等新 handler，也是对 `WaitGroup` 的误用。把关闭监听器这件事交给 `Shutdown` 做，顺序才是安全的。
 
 ### 6.10 容量、限流与监控由应用提供
 
@@ -730,12 +829,14 @@ Hub 只维护注册表，不做全局连接数上限、单 key 连接上限或 I
 
 | 信号 | 来源 |
 |---|---|
-| 在线连接数 / 单 key 连接数 | `Hub.Online(key)` |
+| 单 key 连接数（瞬时快照） | `Hub.Online(key)` |
 | 被挤掉的旧事件数 | `Push` / `Broadcast` 的 `dropped` 返回值 |
 | 客户端断开、写超时 | `ErrClientGone` / `ErrWriteTimeout` |
 | 帧超限 | `ErrFrameTooLarge` |
 
 生产上建议再自行记录：连接活跃时长与异常断开率、上游 AI 请求的取消率、每实例的文件描述符数量。
+
+**`Online` 不能用于严格限流。** 它只是某个时刻单个 key 的快照，也不提供全局在线总数；`if hub.Online(key) < limit { hub.Subscribe(key) }` 是非原子的 check-then-act，并发请求照样会突破上限。它适合监控与近似判断，严格限流要用应用级 semaphore、原子计数器或网关。
 
 ## 7. 测试
 
@@ -753,7 +854,7 @@ Hub 只维护注册表，不做全局连接数上限、单 key 连接上限或 I
 - [reliability_test.go](./reliability_test.go)
 - [fuzz_test.go](./fuzz_test.go)
 - [startup_test.go](./startup_test.go)
-- [gincompat/](./gincompat)（独立模块：gin 集成回归）
+- [gincompat/](./gincompat)（独立模块：gin 集成回归，17 个测试）
 - [example_test.go](./example_test.go)
 
 覆盖点包括：
@@ -813,7 +914,9 @@ func OrderEvents(c *gin.Context) {
     //    它返回一个内部安全标识，后续所有操作都用它——避免"授权带 tenantID、
     //    读快照只用 orderID"这种作用域漂移读到别的租户数据。
     res, err := svc.Authorize(c.Request.Context(), tenantID, uid, orderID)
-    if err != nil {
+    if err != nil || !res.Valid() {
+        // 二次校验：授权实现若因 bug 返回零值标识与 nil error，key 会退化成一个
+        // 固定值，多个异常请求就此落进同一队列、互相串流（见 4.15）。
         c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "无权访问"})
         return
     }
@@ -871,7 +974,7 @@ func OrderEvents(c *gin.Context) {
     for {
         select {
         case <-appShutdown.Done(): // 应用停机（见 6.9）
-            _ = stream.Close(gin.H{"reason": "server shutting down"})
+            closeStream(stream, gin.H{"reason": "server shutting down"})
             return
 
         case <-stream.Context().Done(): // 客户端断开
@@ -906,7 +1009,7 @@ func OrderEvents(c *gin.Context) {
             lastRev = rev
 
             if isTerminal(e) { // 终态：主动结束，避免前端自动重连（见 6.4）
-                _ = stream.Close(gin.H{"reason": "final"})
+                closeStream(stream, gin.H{"reason": "final"})
                 return
             }
         }
@@ -1001,4 +1104,6 @@ gin 的集成由仓库内的独立模块 [gincompat](./gincompat) 持续验证�
 cd gincompat && go test -race ./...
 ```
 
-覆盖：长连接不被 `http.Server.WriteTimeout` 截断、客户端断开判定为 `ErrClientGone`、Hub 端到端推送并由客户端 `Decode` 解回、心跳 goroutine 在 handler 返回前收尾（`-race` 下并发多轮）、起流前后错误处理分界、与 Recovery / Logger 中间件共存。
+覆盖：长连接不被 `http.Server.WriteTimeout` 截断、客户端断开判定为 `ErrClientGone`、Hub 端到端推送并由客户端 `Decode` 解回、心跳 goroutine 在 handler 返回前收尾（`-race` 下并发多轮）、心跳写错误不阻塞 handler、起流前后错误处理分界、与 Recovery / Logger 中间件共存。
+
+状态推送的正确性契约也在这里固定：读快照期间的变更不丢、积压与乱序的旧 revision 被过滤、无效 revision 被上报而非静默丢弃、空身份与零值授权结果不进入 Hub、跨租户隔离（两个租户用同一 orderID，断言各自真实连接的完整事件序列）、终止帧失败被上报。其中隔离与终止帧两类断言做过反向验证——故意改坏实现后测试确实会失败。

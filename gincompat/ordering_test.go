@@ -2,6 +2,7 @@ package gincompat
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -263,11 +264,34 @@ func TestScopeKeyHasNoCollision(t *testing.T) {
 	}
 }
 
-// TestTenantCannotReachOtherTenantOrder 验证跨租户隔离走的是真实 handler 链路：
+// collectIDs 读一条真实 SSE 连接直到 close 事件，返回收到的事件 id 序列。
+func collectIDs(t *testing.T, body io.Reader) []string {
+	t.Helper()
+
+	var ids []string
+	for msg, err := range ssex.Decode(body) {
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		ids = append(ids, msg.ID)
+		if msg.Name == "close" {
+			break
+		}
+	}
+
+	return ids
+}
+
+// TestTenantCannotReachOtherTenantOrder 验证跨租户隔离，走的是真实 handler 链路：
 // 从 gin.Context 取 tenant → 资源授权 → 计算 scoped key → Subscribe → 同作用域读快照。
 //
 // 两个租户用的是**同一个 orderID**。若 key 不带租户作用域（直接用 orderID），
 // 租户 B 的连接会收到租户 A 的订单状态。
+//
+// 负向断言必须读租户 B 的**真实连接**：早先的版本在推送之后另开一个订阅来检查，
+// 而 Hub 不重放历史事件，那个通道天然为空——无论隔离是否生效都会通过。
+// 这里给两个租户各推一条自己的终态事件，于是两条流都有明确终止点，
+// 可以完整读出各自收到的 id 序列再做断言。
 func TestTenantCannotReachOtherTenantOrder(t *testing.T) {
 	t.Parallel()
 
@@ -275,14 +299,14 @@ func TestTenantCannotReachOtherTenantOrder(t *testing.T) {
 	deps := orderEventsDeps{
 		hub:         hub,
 		appShutdown: context.Background(),
-		// 每个租户只能访问自己的订单；返回的内部标识带租户作用域
 		authorize: func(_ context.Context, id identity, orderID string) (resource, error) {
 			return resource{tenantID: id.tenant, internalID: orderID}, nil
 		},
 		load: func(_ context.Context, res resource) (int64, gin.H, error) {
 			return 1, gin.H{"tenant": res.tenantID}, nil
 		},
-		terminal: func(e ssex.Event) bool { return e.ID == "9" },
+		// 两个租户各自的终态：A 是 9，B 是 8
+		terminal: func(e ssex.Event) bool { return e.ID == "9" || e.ID == "8" },
 	}
 
 	// 两个租户，同一个 orderID
@@ -305,49 +329,72 @@ func TestTenantCannotReachOtherTenantOrder(t *testing.T) {
 
 	keyA := keyFor("tenantA", "100")
 	keyB := keyFor("tenantB", "100")
+	if keyA == keyB {
+		t.Fatalf("两个租户算出了同一个 key: %q", keyA)
+	}
 	waitFor(t, "两个租户都完成订阅", func() bool {
 		return hub.Online(keyA) == 1 && hub.Online(keyB) == 1
 	})
 
-	// 只向租户 A 的 scoped key 推送
+	// A 收到 rev 9（终态），B 收到它自己的 rev 8（终态）
 	if delivered, _ := hub.Push(keyA, ssex.Event{ID: "9", Name: "status", Data: gin.H{"status": "paid"}}); delivered != 1 {
 		t.Fatalf("Push 到 keyA delivered = %d, want 1", delivered)
 	}
-
-	// 租户 A 应收到快照 + paid + close
-	var gotA []string
-	for msg, err := range ssex.Decode(respA.Body) {
-		if err != nil {
-			t.Fatalf("租户 A decode: %v", err)
-		}
-		gotA = append(gotA, msg.ID)
-		if msg.Name == "close" {
-			break
-		}
+	if delivered, _ := hub.Push(keyB, ssex.Event{ID: "8", Name: "status", Data: gin.H{"status": "shipped"}}); delivered != 1 {
+		t.Fatalf("Push 到 keyB delivered = %d, want 1", delivered)
 	}
+
+	gotA := collectIDs(t, respA.Body)
+	gotB := collectIDs(t, respB.Body)
+
+	// 各自只应看到 自己的快照(1) → 自己的终态 → close
 	if len(gotA) != 3 || gotA[1] != "9" {
 		t.Fatalf("租户 A event ids = %v, want [1 9 ...]", gotA)
 	}
-
-	// 租户 B 只应有自己的快照，绝不能出现 rev 9
-	if hub.Online(keyB) != 1 {
-		t.Fatalf("租户 B 的订阅意外消失")
+	if len(gotB) != 3 || gotB[1] != "8" {
+		t.Fatalf("租户 B event ids = %v, want [1 8 ...]", gotB)
 	}
-	select {
-	case leaked := <-eventsOf(t, hub, keyB):
-		t.Fatalf("租户 B 收到了租户 A 的事件: %+v", leaked)
-	default:
+
+	// 真正的负向断言：租户 B 的连接里绝不能出现租户 A 的 rev 9
+	for _, id := range gotB {
+		if id == "9" {
+			t.Fatalf("租户 B 收到了租户 A 的事件（ids = %v）", gotB)
+		}
 	}
 }
 
-// eventsOf 额外订阅一次同一个 key，用于检查是否有事件泄漏到该 key。
-// 它订阅的是新连接，因此只会收到订阅之后投递的事件——本测试用它确认
-// 推送给租户 A 的事件没有落到租户 B 的 key 上。
-func eventsOf(t *testing.T, hub *ssex.Hub, key string) <-chan ssex.Event {
-	t.Helper()
+// TestZeroAuthResultIsRejected 验证授权实现返回零值 resource 时请求被拒。
+//
+// 授权实现若因 bug 返回 (resource{}, nil)，scopeKey() 会算出一个固定值，
+// 所有这类异常请求就落进同一个队列、互相收到对方的事件。handler 必须在
+// 订阅之前二次校验授权结果。
+func TestZeroAuthResultIsRejected(t *testing.T) {
+	t.Parallel()
 
-	events, release := hub.Subscribe(key)
-	t.Cleanup(release)
+	hub := ssex.NewHub()
+	deps := orderEventsDeps{
+		hub:         hub,
+		appShutdown: context.Background(),
+		// 模拟有 bug 的授权实现：既不报错也不返回有效标识
+		authorize: func(context.Context, identity, string) (resource, error) {
+			return resource{}, nil
+		},
+	}
 
-	return events
+	server := httptest.NewServer(newEngine(deps, authedIdentity()))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/events/orders/o1")
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+	// 关键：零值授权结果算出的固定 key 不得进入注册表
+	if got := hub.Online(resource{}.scopeKey()); got != 0 {
+		t.Fatalf("Online(%q) = %d, want 0（零值授权结果进了 Hub）", resource{}.scopeKey(), got)
+	}
 }

@@ -150,15 +150,18 @@ func (s *Stream) Heartbeat(ctx context.Context, interval time.Duration) error {
 // Close 只终结本流的写入许可，不关闭 HTTP 连接——连接在 handler 返回时结束。
 // 即使终止事件写入失败（客户端已断开），流同样标记为已终止。重复调用返回 ErrStreamClosed。
 func (s *Stream) Close(payload any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 与 send 同样的顺序:状态先于参数,重复 Close 一律返回 ErrStreamClosed,
+	// 不受载荷能否序列化影响。
+	if s.closed {
+		return ErrStreamClosed
+	}
+
 	frame, err := buildEventFrame("", "close", payload)
 	if err != nil {
 		return err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return ErrStreamClosed
 	}
 
 	if startErr := s.startLocked(); startErr != nil {
@@ -192,16 +195,23 @@ func (s *Stream) Context() context.Context {
 // send 先构造帧,构造失败时不提交响应头(调用方仍可改回普通 JSON 响应);
 // 构造成功后才在锁内起流并写出。
 func (s *Stream) send(op string, build func() (string, error)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 状态先于参数:流已终止时直接返回 ErrStreamClosed,不再构造帧。
+	// 否则"已终止 + 载荷不可序列化"会返回序列化错误,与 ErrStreamClosed 的
+	// 契约冲突,调用方按 errors.Is 判断就会漏掉"流已经关了"这个事实。
+	if s.closed {
+		return ErrStreamClosed
+	}
+
+	// 构造放在起流之前:失败时响应头尚未提交,调用方仍可改回普通 JSON 响应。
+	// 放在锁内不会增加争用——同一个 Stream 的写入本来就是串行的。
 	frame, err := build()
 	if err != nil {
 		return err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return ErrStreamClosed
-	}
 	if err := s.startLocked(); err != nil {
 		return err
 	}
@@ -215,6 +225,12 @@ func (s *Stream) send(op string, build func() (string, error)) error {
 // 调用方仍可改用普通 JSON 响应回错。响应头一旦提交(即使随后刷新失败)就标记为
 // 已开始,避免重复提交触发标准库的 superfluous response.WriteHeader。
 func (s *Stream) startLocked() error {
+	// 流已终止后不得再提交响应头:Close 在起流失败时也会把流标记为已终止,
+	// 若这里不挡住,随后的 Start 会成功提交响应头,形成 started 与 closed
+	// 同时为真的矛盾状态。
+	if s.closed {
+		return ErrStreamClosed
+	}
 	if s.started {
 		return nil
 	}
